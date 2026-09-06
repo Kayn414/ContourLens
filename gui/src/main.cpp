@@ -727,7 +727,7 @@ int main(int argc, char** argv)
 
             if (ImGui::IsWindowHovered() && io.MouseWheel != 0.0f)
             {
-                if (io.KeyCtrl)
+                if ((::GetKeyState(VK_CONTROL) & 0x8000) != 0)
                     axial_zoom = std::clamp(axial_zoom * powf(1.1f, io.MouseWheel), kMinZoom, kMaxZoom);
                 else
                 {
@@ -845,7 +845,7 @@ int main(int argc, char** argv)
 
             if (ImGui::IsWindowHovered() && io.MouseWheel != 0.0f)
             {
-                if (io.KeyCtrl)
+                if ((::GetKeyState(VK_CONTROL) & 0x8000) != 0)
                     coronal_zoom = std::clamp(coronal_zoom * powf(1.1f, io.MouseWheel), kMinZoom, kMaxZoom);
                 else
                 {
@@ -899,7 +899,7 @@ int main(int argc, char** argv)
 
             if (ImGui::IsWindowHovered() && io.MouseWheel != 0.0f)
             {
-                if (io.KeyCtrl)
+                if ((::GetKeyState(VK_CONTROL) & 0x8000) != 0)
                     sagittal_zoom = std::clamp(sagittal_zoom * powf(1.1f, io.MouseWheel), kMinZoom, kMaxZoom);
                 else
                 {
