@@ -10,21 +10,55 @@
 #include "volume.h"
 #include "raycaster.h"
 #include "dvh.h"
+#include "inference.h"
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <vector>
 #include <d3d11.h>
 #include <tchar.h>
 
-// Distinct colors for up to 9 overlay structures (wraps via modulo past that).
-static const uint8_t kLabelColors[][3] = {
+// Canonical structure name -> color, so the SAME structure always gets the
+// SAME color whether it comes from the ground-truth masks (whose label list
+// is alphabetical filenames, includes "brain", excludes "spinal_cord" - see
+// source/data/phantom.py) or the model prediction (source/data/hanseg.py's
+// LABEL_IDS order). Matching by name (not by list position/index) is what
+// makes overlaying both meaningful for comparison. Unrecognized names fall
+// back to the last color.
+static const char* kCanonicalStructureNames[] = {
+    "brainstem", "optic_chiasm", "optic_nerve_l", "optic_nerve_r", "lens_l",
+    "lens_r", "eyeball_l", "eyeball_r", "spinal_cord", "brain",
+};
+static const uint8_t kCanonicalStructureColors[][3] = {
     { 230, 60, 60 },   { 60, 160, 230 },  { 250, 200, 60 },
     { 120, 220, 120 }, { 200, 100, 220 }, { 80, 220, 200 },
-    { 240, 140, 60 },  { 160, 160, 250 }, { 250, 250, 120 },
+    { 240, 140, 60 },  { 160, 160, 250 }, { 250, 250, 120 }, { 200, 200, 200 },
 };
-static const int kNumLabelColors = sizeof(kLabelColors) / sizeof(kLabelColors[0]);
+static const int kNumCanonicalStructures = sizeof(kCanonicalStructureNames) / sizeof(kCanonicalStructureNames[0]);
+
+static const uint8_t* ColorForStructureName(const std::string& name)
+{
+    for (int i = 0; i < kNumCanonicalStructures; ++i)
+        if (name == kCanonicalStructureNames[i])
+            return kCanonicalStructureColors[i];
+    return kCanonicalStructureColors[kNumCanonicalStructures - 1];
+}
+
+// Precomputed per-label-id (index = id - 1) colors for one label volume, so
+// UploadSlice's hot loop does array lookups instead of string compares.
+static std::vector<std::array<uint8_t, 3>> BuildLabelColors(const std::vector<std::string>& names)
+{
+    std::vector<std::array<uint8_t, 3>> colors(names.size());
+    for (size_t i = 0; i < names.size(); ++i)
+    {
+        const uint8_t* c = ColorForStructureName(names[i]);
+        colors[i] = { c[0], c[1], c[2] };
+    }
+    return colors;
+}
 
 static ID3D11Device* g_pd3dDevice = nullptr;
 static ID3D11DeviceContext* g_pd3dDeviceContext = nullptr;
@@ -95,13 +129,24 @@ static bool CreateSliceTexture(int width, int height, ID3D11Texture2D** out_tex,
     return true;
 }
 
+// One overlay (ground truth masks, model prediction, ...) composited onto a
+// slice's grayscale: `get_label(col, row)` returns a label id (0 = none);
+// `colors`/`visible` are indexed by id-1 (see BuildLabelColors/LoadLabelVolume).
+// Multiple layers blend in order, each std::function so UploadSlice can take
+// a plain vector of them instead of an ever-growing template parameter pack.
+struct OverlayLayer
+{
+    std::function<uint8_t(int, int)> get_label;
+    bool enabled = false;
+    float alpha = 0.45f;
+    const std::vector<bool>* visible = nullptr;
+    const std::vector<std::array<uint8_t, 3>>* colors = nullptr;
+};
+
 // Windows HU to a grayscale byte: (hu - (wl - ww/2)) / ww, clamped to [0,1],
-// then optionally tints it towards that voxel's overlay structure color.
-// `get_voxel`/`get_label(col, row)` pick the plane; callers below index the
-// volume differently for axial/coronal/sagittal but share this upload path.
-template <typename GetVoxel, typename GetLabel>
+// then composites each enabled overlay layer's structure color on top.
 static void UploadSlice(ID3D11Texture2D* tex, int width, int height, float window_width, float window_level,
-    GetVoxel get_voxel, GetLabel get_label, bool overlay_enabled, float overlay_alpha, const std::vector<bool>& label_visible)
+    const std::function<int16_t(int, int)>& get_voxel, const std::vector<OverlayLayer>& layers)
 {
     D3D11_MAPPED_SUBRESOURCE mapped;
     if (FAILED(g_pd3dDeviceContext->Map(tex, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
@@ -115,24 +160,28 @@ static void UploadSlice(ID3D11Texture2D* tex, int width, int height, float windo
         {
             float t = (get_voxel(col, row) - lo) / window_width;
             uint8_t gray = (uint8_t)(std::clamp(t, 0.0f, 1.0f) * 255.0f + 0.5f);
-            uint8_t r = gray, g = gray, b = gray;
+            float r = gray, g = gray, b = gray;
 
-            if (overlay_enabled)
+            for (const OverlayLayer& layer : layers)
             {
-                uint8_t label = get_label(col, row);
+                if (!layer.enabled)
+                    continue;
+                uint8_t label = layer.get_label(col, row);
+                if (label == 0)
+                    continue;
                 size_t li = (size_t)label - 1;
-                if (label != 0 && li < label_visible.size() && label_visible[li])
-                {
-                    const uint8_t* c = kLabelColors[li % kNumLabelColors];
-                    r = (uint8_t)(gray * (1.0f - overlay_alpha) + c[0] * overlay_alpha);
-                    g = (uint8_t)(gray * (1.0f - overlay_alpha) + c[1] * overlay_alpha);
-                    b = (uint8_t)(gray * (1.0f - overlay_alpha) + c[2] * overlay_alpha);
-                }
+                bool visible = !layer.visible || (li < layer.visible->size() && (*layer.visible)[li]);
+                if (!visible || !layer.colors || li >= layer.colors->size())
+                    continue;
+                const auto& c = (*layer.colors)[li];
+                r = r * (1.0f - layer.alpha) + c[0] * layer.alpha;
+                g = g * (1.0f - layer.alpha) + c[1] * layer.alpha;
+                b = b * (1.0f - layer.alpha) + c[2] * layer.alpha;
             }
 
-            dst[col * 4 + 0] = r;
-            dst[col * 4 + 1] = g;
-            dst[col * 4 + 2] = b;
+            dst[col * 4 + 0] = (uint8_t)r;
+            dst[col * 4 + 1] = (uint8_t)g;
+            dst[col * 4 + 2] = (uint8_t)b;
             dst[col * 4 + 3] = 255;
         }
     }
@@ -287,6 +336,19 @@ int main(int, char**)
     bool show_overlays = true;   // "View > Structure overlays" toggle
     float overlay_alpha = 0.45f;
     std::vector<bool> label_visible;
+    std::vector<std::array<uint8_t, 3>> label_colors;
+
+    // Model prediction overlay (source/run_inference_for_gui.py, launched by
+    // the "Run Inference" button below). Independent from the ground-truth
+    // layer above so both can be shown/compared at once; same color per
+    // structure name (ColorForStructureName), different toggle/alpha/checkboxes.
+    LabelVolume prediction_volume;
+    bool prediction_loaded = false;
+    bool show_prediction_overlay = false;
+    float prediction_overlay_alpha = 0.45f;
+    std::vector<bool> prediction_label_visible;
+    std::vector<std::array<uint8_t, 3>> prediction_label_colors;
+    InferenceJob inference_job;
 
     // Raycast 3D panel.
     Raycaster raycaster;
@@ -335,6 +397,7 @@ int main(int, char**)
         if (masks_loaded)
         {
             label_visible.assign(label_volume.labels.size(), true);
+            label_colors = BuildLabelColors(label_volume.labels);
 
             DoseVolume dose_volume;
             bool real_dose_loaded = LoadDoseVolume(std::string(DICOM_RT_DATA_DIR) + "/phantom/gui_export/dose", dose_volume);
@@ -360,6 +423,21 @@ int main(int, char**)
         {
             fprintf(stderr, "Failed to load mask volume (see LoadLabelVolume errors above); run "
                              "source/export_gui_volume.py --export-masks first. Overlays/DVH disabled.\n");
+        }
+
+        // A prediction from a previous "Run Inference" click may already be on disk.
+        prediction_loaded = LoadLabelVolume(std::string(DICOM_RT_DATA_DIR) + "/phantom/gui_export/prediction", prediction_volume);
+        if (prediction_loaded && (prediction_volume.nx != ct_volume.nx || prediction_volume.ny != ct_volume.ny || prediction_volume.nz != ct_volume.nz))
+        {
+            fprintf(stderr, "Prediction volume shape %dx%dx%d doesn't match CT shape %dx%dx%d; ignoring it\n",
+                prediction_volume.nx, prediction_volume.ny, prediction_volume.nz, ct_volume.nx, ct_volume.ny, ct_volume.nz);
+            prediction_loaded = false;
+        }
+        if (prediction_loaded)
+        {
+            prediction_label_visible.assign(prediction_volume.labels.size(), true);
+            prediction_label_colors = BuildLabelColors(prediction_volume.labels);
+            show_prediction_overlay = true; // matches show_overlays' always-on-when-loaded default
         }
     }
     else
@@ -407,6 +485,32 @@ int main(int, char**)
             dock_layout_built = true;
         }
 
+        // If a "Run Inference" job finished this frame, reload its output.
+        if (PollInferenceJob(inference_job))
+        {
+            if (inference_job.exit_code == 0)
+            {
+                prediction_loaded = LoadLabelVolume(std::string(DICOM_RT_DATA_DIR) + "/phantom/gui_export/prediction", prediction_volume);
+                if (prediction_loaded && (prediction_volume.nx != ct_volume.nx || prediction_volume.ny != ct_volume.ny || prediction_volume.nz != ct_volume.nz))
+                {
+                    fprintf(stderr, "Prediction volume shape %dx%dx%d doesn't match CT shape %dx%dx%d; ignoring it\n",
+                        prediction_volume.nx, prediction_volume.ny, prediction_volume.nz, ct_volume.nx, ct_volume.ny, ct_volume.nz);
+                    prediction_loaded = false;
+                }
+                if (prediction_loaded)
+                {
+                    prediction_label_visible.assign(prediction_volume.labels.size(), true);
+                    prediction_label_colors = BuildLabelColors(prediction_volume.labels);
+                    show_prediction_overlay = true;
+                    k_dirty = j_dirty = i_dirty = true;
+                }
+            }
+            else
+            {
+                fprintf(stderr, "Inference job exited with code %lu; see its console output above\n", inference_job.exit_code);
+            }
+        }
+
         bool overlay_toggled_from_menu = false;
         if (ImGui::BeginMainMenuBar())
         {
@@ -419,6 +523,8 @@ int main(int, char**)
             if (ImGui::BeginMenu("View"))
             {
                 if (ImGui::MenuItem("Structure overlays", nullptr, &show_overlays, masks_loaded))
+                    overlay_toggled_from_menu = true;
+                if (ImGui::MenuItem("Prediction overlay", nullptr, &show_prediction_overlay, prediction_loaded))
                     overlay_toggled_from_menu = true;
                 ImGui::MenuItem("DVH", nullptr, &show_dvh, masks_loaded);
                 ImGui::EndMenu();
@@ -455,13 +561,13 @@ int main(int, char**)
             if (wl_changed)
                 k_dirty = j_dirty = i_dirty = true;
 
-            if (masks_loaded && ImGui::CollapsingHeader("Structures"))
+            if (masks_loaded && ImGui::CollapsingHeader("Structures (ground truth)"))
             {
-                bool overlay_ui_changed = ImGui::SliderFloat("Overlay opacity", &overlay_alpha, 0.0f, 1.0f, "%.2f");
+                bool overlay_ui_changed = ImGui::SliderFloat("Overlay opacity##gt", &overlay_alpha, 0.0f, 1.0f, "%.2f");
                 for (size_t li = 0; li < label_volume.labels.size(); ++li)
                 {
                     ImGui::PushID((int)li);
-                    const uint8_t* c = kLabelColors[li % kNumLabelColors];
+                    const auto& c = label_colors[li];
                     ImGui::ColorButton("##swatch", ImVec4(c[0] / 255.0f, c[1] / 255.0f, c[2] / 255.0f, 1.0f),
                         ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoPicker, ImVec2(12, 12));
                     ImGui::SameLine();
@@ -477,12 +583,55 @@ int main(int, char**)
                     k_dirty = j_dirty = i_dirty = true;
             }
 
+            if (ImGui::CollapsingHeader("Prediction"))
+            {
+                ImGui::BeginDisabled(inference_job.running);
+                if (ImGui::Button("Run Inference"))
+                    StartInferenceJob(inference_job, DICOM_RT_REPO_DIR);
+                ImGui::EndDisabled();
+                if (inference_job.running)
+                {
+                    ImGui::SameLine();
+                    ImGui::Text("Running... (%.0fs) - nnU-Net 4-fold ensemble, see console for progress", (GetTickCount() - inference_job.start_tick_ms) / 1000.0f);
+                }
+                else if (!prediction_loaded)
+                {
+                    ImGui::TextUnformatted("No prediction loaded yet.");
+                }
+
+                if (prediction_loaded)
+                {
+                    bool overlay_ui_changed = ImGui::SliderFloat("Overlay opacity##pred", &prediction_overlay_alpha, 0.0f, 1.0f, "%.2f");
+                    for (size_t li = 0; li < prediction_volume.labels.size(); ++li)
+                    {
+                        ImGui::PushID((int)(li + 1000));
+                        const auto& c = prediction_label_colors[li];
+                        ImGui::ColorButton("##swatch", ImVec4(c[0] / 255.0f, c[1] / 255.0f, c[2] / 255.0f, 1.0f),
+                            ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoPicker, ImVec2(12, 12));
+                        ImGui::SameLine();
+                        bool visible = prediction_label_visible[li];
+                        if (ImGui::Checkbox(prediction_volume.labels[li].c_str(), &visible))
+                        {
+                            prediction_label_visible[li] = visible;
+                            overlay_ui_changed = true;
+                        }
+                        ImGui::PopID();
+                    }
+                    if (overlay_ui_changed)
+                        k_dirty = j_dirty = i_dirty = true;
+                }
+            }
+
             if (k_dirty)
             {
+                std::vector<OverlayLayer> layers = {
+                    { [&](int i, int j) { return masks_loaded ? label_volume.At(i, j, cursor_k) : (uint8_t)0; },
+                      show_overlays, overlay_alpha, &label_visible, &label_colors },
+                    { [&](int i, int j) { return prediction_loaded ? prediction_volume.At(i, j, cursor_k) : (uint8_t)0; },
+                      show_prediction_overlay, prediction_overlay_alpha, &prediction_label_visible, &prediction_label_colors },
+                };
                 UploadSlice(axial_tex, ct_volume.nx, ct_volume.ny, window_width, window_level,
-                    [&](int i, int j) { return ct_volume.At(i, j, cursor_k); },
-                    [&](int i, int j) { return masks_loaded ? label_volume.At(i, j, cursor_k) : (uint8_t)0; },
-                    show_overlays, overlay_alpha, label_visible);
+                    [&](int i, int j) { return ct_volume.At(i, j, cursor_k); }, layers);
                 k_dirty = false;
             }
 
@@ -520,10 +669,14 @@ int main(int, char**)
             if (j_dirty)
             {
                 // width=x, height=z; row 0 = k=0 (inferior) -- flip via UV below so superior is on top.
+                std::vector<OverlayLayer> layers = {
+                    { [&](int i, int k) { return masks_loaded ? label_volume.At(i, cursor_j, k) : (uint8_t)0; },
+                      show_overlays, overlay_alpha, &label_visible, &label_colors },
+                    { [&](int i, int k) { return prediction_loaded ? prediction_volume.At(i, cursor_j, k) : (uint8_t)0; },
+                      show_prediction_overlay, prediction_overlay_alpha, &prediction_label_visible, &prediction_label_colors },
+                };
                 UploadSlice(coronal_tex, ct_volume.nx, ct_volume.nz, window_width, window_level,
-                    [&](int i, int k) { return ct_volume.At(i, cursor_j, k); },
-                    [&](int i, int k) { return masks_loaded ? label_volume.At(i, cursor_j, k) : (uint8_t)0; },
-                    show_overlays, overlay_alpha, label_visible);
+                    [&](int i, int k) { return ct_volume.At(i, cursor_j, k); }, layers);
                 j_dirty = false;
             }
 
@@ -561,10 +714,14 @@ int main(int, char**)
             if (i_dirty)
             {
                 // width=y, height=z; same vertical flip as coronal (superior on top).
+                std::vector<OverlayLayer> layers = {
+                    { [&](int j, int k) { return masks_loaded ? label_volume.At(cursor_i, j, k) : (uint8_t)0; },
+                      show_overlays, overlay_alpha, &label_visible, &label_colors },
+                    { [&](int j, int k) { return prediction_loaded ? prediction_volume.At(cursor_i, j, k) : (uint8_t)0; },
+                      show_prediction_overlay, prediction_overlay_alpha, &prediction_label_visible, &prediction_label_colors },
+                };
                 UploadSlice(sagittal_tex, ct_volume.ny, ct_volume.nz, window_width, window_level,
-                    [&](int j, int k) { return ct_volume.At(cursor_i, j, k); },
-                    [&](int j, int k) { return masks_loaded ? label_volume.At(cursor_i, j, k) : (uint8_t)0; },
-                    show_overlays, overlay_alpha, label_visible);
+                    [&](int j, int k) { return ct_volume.At(cursor_i, j, k); }, layers);
                 i_dirty = false;
             }
 
@@ -662,7 +819,7 @@ int main(int, char**)
                     ImPlot::SetupAxes("Dose (Gy)", "Volume (%)");
                     for (size_t li = 0; li < dvh_curves.size(); ++li)
                     {
-                        const uint8_t* c = kLabelColors[li % kNumLabelColors];
+                        const uint8_t* c = ColorForStructureName(dvh_curves[li].name);
                         ImPlotSpec spec;
                         spec.LineColor = ImVec4(c[0] / 255.0f, c[1] / 255.0f, c[2] / 255.0f, 1.0f);
                         ImPlot::PlotLine(dvh_curves[li].name.c_str(), dvh_curves[li].dose_gy.data(), dvh_curves[li].volume_pct.data(),
@@ -698,6 +855,7 @@ int main(int, char**)
     if (sagittal_srv) sagittal_srv->Release();
     if (sagittal_tex) sagittal_tex->Release();
     if (raycaster_ok) ReleaseRaycaster(raycaster);
+    if (inference_job.process_handle) CloseHandle(inference_job.process_handle); // let a still-running job finish on its own
 
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();

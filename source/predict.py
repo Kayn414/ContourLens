@@ -12,9 +12,11 @@ from source.data.nnunet_dataset import DATASET_ID, nnunet_env, resolve_nnunet_re
 from source.data.phantom import NNUNET_INPUT_DIR, build_ct_nifti
 
 CONFIGURATION = "3d_fullres"
-TRAINER = "nnUNetTrainer"
+# Matches the completed production run (source/modal_nnunet.py's
+# PRODUCTION_TRAINER/PRODUCTION_FOLDS) -- fold 4 was skipped for budget.
+TRAINER = "nnUNetTrainer_500epochs"
 PLANS = "nnUNetPlans"
-FOLDS = ("0", "1", "2", "3", "4")
+FOLDS = ("0", "1", "2", "3")
 
 PREDICTION_DIR = Path("data/phantom/nnunet_prediction")
 

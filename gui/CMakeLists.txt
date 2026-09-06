@@ -32,6 +32,7 @@ add_executable(dicom_rt_gui
   src/volume.cpp
   src/raycaster.cpp
   src/dvh.cpp
+  src/inference.cpp
   ${imgui_SOURCE_DIR}/imgui.cpp
   ${imgui_SOURCE_DIR}/imgui_draw.cpp
   ${imgui_SOURCE_DIR}/imgui_tables.cpp
@@ -51,8 +52,13 @@ target_include_directories(dicom_rt_gui PRIVATE
 
 target_link_libraries(dicom_rt_gui PRIVATE d3d11.lib dxgi.lib d3dcompiler.lib nlohmann_json::nlohmann_json)
 
-# Volume exports (source/export_gui_volume.py) live under <repo>/data; resolve
-# relative to the repo regardless of the exe's working directory.
-target_compile_definitions(dicom_rt_gui PRIVATE DICOM_RT_DATA_DIR="${CMAKE_SOURCE_DIR}/../data")
+# Volume exports (source/export_gui_volume.py) live under <repo>/data, and
+# "Run Inference" (gui/src/inference.cpp) shells out to `uv run python -m
+# source...` from the repo root -- resolve both relative to the repo
+# regardless of the exe's own working directory.
+target_compile_definitions(dicom_rt_gui PRIVATE
+  DICOM_RT_DATA_DIR="${CMAKE_SOURCE_DIR}/../data"
+  DICOM_RT_REPO_DIR="${CMAKE_SOURCE_DIR}/.."
+)
 
 set_target_properties(dicom_rt_gui PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)

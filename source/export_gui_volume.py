@@ -97,6 +97,38 @@ def export_label_volume(mask_dir: Path, reference_nifti: Path, out_dir: Path, na
     print(f"{mask_dir} ({len(labels)} structures: {', '.join(labels)}) -> {bin_path}, {json_path}")
 
 
+def export_prediction_volume(prediction_nifti: Path, out_dir: Path, name: str = "prediction") -> None:
+    """Export an nnU-Net multi-label prediction (source/predict.py's output)
+    as a GUI overlay, same on-disk shape as export_label_volume's but built
+    from source.data.hanseg.LABEL_IDS instead of a directory of binary masks
+    -- nnU-Net already writes one file with the canonical ids baked in.
+    """
+    from source.data.hanseg import LABEL_IDS
+
+    image = sitk.ReadImage(str(prediction_nifti))
+    array = sitk.GetArrayFromImage(image)  # (z, y, x), uint8 label ids
+
+    labels: list[str] = [""] * len(LABEL_IDS)
+    for structure_name, label_id in LABEL_IDS.items():
+        labels[label_id - 1] = structure_name
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    bin_path = out_dir / f"{name}.bin"
+    json_path = out_dir / f"{name}.json"
+
+    array.astype(np.uint8).tofile(bin_path)
+    json_path.write_text(json.dumps({
+        "shape": list(array.shape),
+        "dtype": "uint8",
+        "spacing": list(image.GetSpacing()),
+        "origin": list(image.GetOrigin()),
+        "direction": list(image.GetDirection()),
+        "labels": labels,
+    }, indent=2))
+
+    print(f"{prediction_nifti} ({len(labels)} structures: {', '.join(labels)}) -> {bin_path}, {json_path}")
+
+
 def export_dose(dose_dicom_path: Path, reference_nifti: Path, out_dir: Path, name: str = "dose") -> None:
     """Read an RTDOSE DICOM file, apply DoseGridScaling (SimpleITK's DICOM
     reader does NOT do this automatically -- it's an RT-specific tag, not the
@@ -144,9 +176,12 @@ def main() -> None:
     parser.add_argument("--export-masks", action="store_true", help="Export the combined OAR label volume instead of the CT.")
     parser.add_argument("--masks-dir", type=Path, default=DEFAULT_MASKS_DIR)
     parser.add_argument("--dose", type=Path, help="Path to an RTDOSE DICOM file; exports it instead of the CT/masks.")
+    parser.add_argument("--prediction", type=Path, help="Path to an nnU-Net prediction .nii.gz; exports it as a label-volume overlay.")
     args = parser.parse_args()
 
-    if args.dose:
+    if args.prediction:
+        export_prediction_volume(args.prediction, args.out_dir, "prediction" if args.name == "ct" else args.name)
+    elif args.dose:
         export_dose(args.dose, args.nifti, args.out_dir, "dose" if args.name == "ct" else args.name)
     elif args.export_masks:
         export_label_volume(args.masks_dir, args.nifti, args.out_dir, "masks" if args.name == "ct" else args.name)
