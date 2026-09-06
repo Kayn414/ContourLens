@@ -30,14 +30,39 @@ DEFAULT_OUT_DIR = Path("data/phantom/gui_export")
 DEFAULT_MASKS_DIR = Path("data/phantom/masks")
 
 
-def export_volume(nifti_path: Path, out_dir: Path, name: str) -> None:
-    image = sitk.ReadImage(str(nifti_path))
+def load_volume_image(path: Path) -> sitk.Image:
+    """Reads a CT (or any single-channel) volume from any of:
+    - a directory of DICOM slices (one series -- if more than one, the
+      largest by file count is used; DICOM is natively LPS, matching the
+      convention this whole module writes),
+    - a single-file NIfTI (.nii/.nii.gz) or NRRD (.nrrd/.nhdr) volume --
+      SimpleITK's format sniffing handles both via plain ReadImage(), no
+      special-casing needed.
+    Either way, the result carries its own real spacing/origin/direction, so
+    the rest of the pipeline (export_volume et al.) doesn't need to know
+    which format/loader produced it.
+    """
+    if path.is_dir():
+        series_ids = sitk.ImageSeriesReader_GetGDCMSeriesIDs(str(path))
+        if not series_ids:
+            raise FileNotFoundError(f"No DICOM series found in {path}")
+        # Multiple series (e.g. scout + real acquisition) can share a directory; take the largest.
+        series_file_lists = [sitk.ImageSeriesReader_GetGDCMSeriesFileNames(str(path), sid) for sid in series_ids]
+        file_names = max(series_file_lists, key=len)
+        reader = sitk.ImageSeriesReader()
+        reader.SetFileNames(file_names)
+        return reader.Execute()
+    return sitk.ReadImage(str(path))
+
+
+def export_volume(source_path: Path, out_dir: Path, name: str) -> None:
+    image = load_volume_image(source_path)
     array = sitk.GetArrayFromImage(image)  # (z, y, x)
 
     if not np.issubdtype(array.dtype, np.integer):
-        raise ValueError(f"{nifti_path}: expected an integer-valued volume, got {array.dtype}")
+        raise ValueError(f"{source_path}: expected an integer-valued volume, got {array.dtype}")
     if array.min() < np.iinfo(np.int16).min or array.max() > np.iinfo(np.int16).max:
-        raise ValueError(f"{nifti_path}: value range [{array.min()}, {array.max()}] doesn't fit int16")
+        raise ValueError(f"{source_path}: value range [{array.min()}, {array.max()}] doesn't fit int16")
     array = array.astype("<i2")  # little-endian int16
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -53,7 +78,7 @@ def export_volume(nifti_path: Path, out_dir: Path, name: str) -> None:
         "direction": list(image.GetDirection()),  # 3x3 row-major
     }, indent=2))
 
-    print(f"{nifti_path} -> {bin_path} ({array.nbytes:,} bytes), {json_path}")
+    print(f"{source_path} -> {bin_path} ({array.nbytes:,} bytes), {json_path}")
 
 
 def export_label_volume(mask_dir: Path, reference_nifti: Path, out_dir: Path, name: str) -> None:
@@ -170,7 +195,8 @@ def export_dose(dose_dicom_path: Path, reference_nifti: Path, out_dir: Path, nam
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--nifti", type=Path, default=DEFAULT_CT)
+    parser.add_argument("--nifti", type=Path, default=DEFAULT_CT,
+        help="CT source: a NIfTI/NRRD file, or a directory of DICOM slices (one series).")
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--name", default="ct")
     parser.add_argument("--export-masks", action="store_true", help="Export the combined OAR label volume instead of the CT.")
