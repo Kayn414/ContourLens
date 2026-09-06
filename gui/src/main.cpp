@@ -1,10 +1,15 @@
 // Minimal Dear ImGui + Win32 + DirectX 11 bootstrap.
 // Modeled closely on imgui/examples/example_win32_directx11/main.cpp (docking branch).
 
+#define NOMINMAX // windows.h's min/max macros shadow std::min/std::max otherwise
 #include "imgui.h"
 #include "imgui_internal.h" // DockBuilder* - forced 2x2 layout, built once on first frame
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
+#include "volume.h"
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
 #include <d3d11.h>
 #include <tchar.h>
 
@@ -50,6 +55,57 @@ static void BuildDockLayout(ImGuiID dockspace_id)
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
+// Axial slice texture: one RGBA8 DYNAMIC texture sized to the volume's
+// (nx, ny), re-uploaded only when the slice index or W/L changes.
+static bool CreateSliceTexture(int width, int height, ID3D11Texture2D** out_tex, ID3D11ShaderResourceView** out_srv)
+{
+    D3D11_TEXTURE2D_DESC desc = {};
+    desc.Width = width;
+    desc.Height = height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DYNAMIC;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(g_pd3dDevice->CreateTexture2D(&desc, nullptr, out_tex)))
+        return false;
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+    srv_desc.Format = desc.Format;
+    srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srv_desc.Texture2D.MipLevels = 1;
+    if (FAILED(g_pd3dDevice->CreateShaderResourceView(*out_tex, &srv_desc, out_srv)))
+        return false;
+
+    return true;
+}
+
+// Windows HU to a grayscale byte: (hu - (wl - ww/2)) / ww, clamped to [0,1].
+static void UploadAxialSlice(ID3D11Texture2D* tex, const Volume& vol, int slice, float window_width, float window_level)
+{
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    if (FAILED(g_pd3dDeviceContext->Map(tex, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+        return;
+
+    const float lo = window_level - window_width * 0.5f;
+    for (int j = 0; j < vol.ny; ++j)
+    {
+        uint8_t* row = (uint8_t*)mapped.pData + (size_t)j * mapped.RowPitch; // honour RowPitch, never assume width*bpp
+        for (int i = 0; i < vol.nx; ++i)
+        {
+            float t = (vol.At(i, j, slice) - lo) / window_width;
+            uint8_t gray = (uint8_t)(std::clamp(t, 0.0f, 1.0f) * 255.0f + 0.5f);
+            row[i * 4 + 0] = gray;
+            row[i * 4 + 1] = gray;
+            row[i * 4 + 2] = gray;
+            row[i * 4 + 3] = 255;
+        }
+    }
+    g_pd3dDeviceContext->Unmap(tex, 0);
+}
+
 int main(int, char**)
 {
     WNDCLASSEXW wc = {
@@ -86,6 +142,35 @@ int main(int, char**)
 
     bool dock_layout_built = false;
     ImVec4 clear_color = ImVec4(0.10f, 0.10f, 0.12f, 1.00f);
+
+    // Milestone 1: hardcode the phantom CT path (see source/export_gui_volume.py).
+    Volume ct_volume;
+    bool ct_loaded = LoadVolume(std::string(DICOM_RT_DATA_DIR) + "/phantom/gui_export/ct", ct_volume);
+
+    ID3D11Texture2D* axial_tex = nullptr;
+    ID3D11ShaderResourceView* axial_srv = nullptr;
+    int axial_slice = 0;
+    float window_width = 400.0f, window_level = 40.0f; // soft tissue preset
+    bool axial_dirty = true;
+
+    if (ct_loaded)
+    {
+        axial_slice = ct_volume.nz / 2;
+        auto [min_it, max_it] = std::minmax_element(ct_volume.data.begin(), ct_volume.data.end());
+        printf("Loaded CT volume: %dx%dx%d spacing=(%.3f,%.3f,%.3f) HU range=[%d,%d]\n",
+            ct_volume.nx, ct_volume.ny, ct_volume.nz,
+            ct_volume.spacing[0], ct_volume.spacing[1], ct_volume.spacing[2],
+            (int)*min_it, (int)*max_it);
+        if (!CreateSliceTexture(ct_volume.nx, ct_volume.ny, &axial_tex, &axial_srv))
+        {
+            fprintf(stderr, "Failed to create axial slice texture\n");
+            ct_loaded = false;
+        }
+    }
+    else
+    {
+        fprintf(stderr, "Failed to load CT volume (see LoadVolume errors above); run source/export_gui_volume.py first\n");
+    }
 
     bool done = false;
     while (!done)
@@ -139,7 +224,42 @@ int main(int, char**)
         }
 
         ImGui::Begin("Axial");
-        ImGui::TextUnformatted("Axial (transversal) - placeholder");
+        if (ct_loaded)
+        {
+            bool changed = axial_dirty;
+            changed |= ImGui::SliderInt("Slice", &axial_slice, 0, ct_volume.nz - 1);
+            changed |= ImGui::SliderFloat("Width", &window_width, 1.0f, 4000.0f, "%.0f");
+            changed |= ImGui::SliderFloat("Level", &window_level, -1000.0f, 1000.0f, "%.0f");
+
+            if (ImGui::Button("Soft 400/40")) { window_width = 400; window_level = 40; changed = true; }
+            ImGui::SameLine();
+            if (ImGui::Button("Lung 1500/-600")) { window_width = 1500; window_level = -600; changed = true; }
+            ImGui::SameLine();
+            if (ImGui::Button("Bone 2000/500")) { window_width = 2000; window_level = 500; changed = true; }
+            ImGui::SameLine();
+            if (ImGui::Button("Brain 80/40")) { window_width = 80; window_level = 40; changed = true; }
+
+            if (ImGui::IsWindowHovered() && io.MouseWheel != 0.0f)
+            {
+                axial_slice = std::clamp(axial_slice - (int)io.MouseWheel, 0, ct_volume.nz - 1);
+                changed = true;
+            }
+
+            if (changed)
+            {
+                UploadAxialSlice(axial_tex, ct_volume, axial_slice, window_width, window_level);
+                axial_dirty = false;
+            }
+
+            ImVec2 avail = ImGui::GetContentRegionAvail();
+            float scale = std::min(avail.x / (float)ct_volume.nx, avail.y / (float)ct_volume.ny);
+            scale = scale > 0.0f ? scale : 1.0f;
+            ImGui::Image((ImTextureID)(intptr_t)axial_srv, ImVec2(ct_volume.nx * scale, ct_volume.ny * scale));
+        }
+        else
+        {
+            ImGui::TextUnformatted("Axial (transversal) - failed to load CT volume, see console");
+        }
         ImGui::End();
 
         ImGui::Begin("Coronal");
@@ -166,6 +286,9 @@ int main(int, char**)
         HRESULT hr = g_pSwapChain->Present(1, 0);
         g_SwapChainOccluded = (hr == DXGI_STATUS_OCCLUDED);
     }
+
+    if (axial_srv) axial_srv->Release();
+    if (axial_tex) axial_tex->Release();
 
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();

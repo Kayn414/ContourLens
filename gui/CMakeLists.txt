@@ -9,8 +9,17 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(imgui)
 
+set(JSON_BuildTests OFF CACHE INTERNAL "")
+FetchContent_Declare(
+  json
+  GIT_REPOSITORY https://github.com/nlohmann/json.git
+  GIT_TAG        v3.11.3
+)
+FetchContent_MakeAvailable(json)
+
 add_executable(dicom_rt_gui
   src/main.cpp
+  src/volume.cpp
   ${imgui_SOURCE_DIR}/imgui.cpp
   ${imgui_SOURCE_DIR}/imgui_draw.cpp
   ${imgui_SOURCE_DIR}/imgui_tables.cpp
@@ -25,6 +34,10 @@ target_include_directories(dicom_rt_gui PRIVATE
   ${imgui_SOURCE_DIR}/backends
 )
 
-target_link_libraries(dicom_rt_gui PRIVATE d3d11.lib dxgi.lib d3dcompiler.lib)
+target_link_libraries(dicom_rt_gui PRIVATE d3d11.lib dxgi.lib d3dcompiler.lib nlohmann_json::nlohmann_json)
+
+# Volume exports (source/export_gui_volume.py) live under <repo>/data; resolve
+# relative to the repo regardless of the exe's working directory.
+target_compile_definitions(dicom_rt_gui PRIVATE DICOM_RT_DATA_DIR="${CMAKE_SOURCE_DIR}/../data")
 
 set_target_properties(dicom_rt_gui PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
