@@ -99,6 +99,63 @@ def plan_and_preprocess(dataset_id: int | str = DATASET_ID):
 
 
 # ============================================================
+# 2b. Predict (single case) -- for checking model accuracy on a HaN-Seg case
+# ============================================================
+# nnU-Net's segmentation-export step holds full-resolution per-class
+# probability maps in RAM; a high-res HaN-Seg CT can exceed what's free on a
+# dev machine already running an IDE/browser/etc (observed: repeatedly
+# killed locally by an OOM guard even with -npp 1 -nps 1). Ample memory here
+# sidesteps that rather than fighting it locally.
+@app.function(
+    image=image,
+    gpu=GPU,
+    cpu=8,
+    memory=32768,
+    volumes={VOL_RAW: raw_volume, VOL_RESULTS: results_vol},
+    timeout=60 * 60,
+)
+def predict_case(
+    case_id: str,
+    dataset_id: str = str(DATASET_ID),
+    configuration: str = CONFIGURATION,
+    folds: str = ",".join(str(f) for f in PRODUCTION_FOLDS),  # comma-separated -- Modal's CLI can't parse tuple[int, ...]
+    trainer: str = PRODUCTION_TRAINER,
+    plans: str = PLANS,
+) -> str:
+    """Predicts one case already present on the raw volume's imagesTr/, and
+    writes the result to <results volume>/predictions/<case_id>.nii.gz.
+    Returns that path (fetch it with `modal volume get`)."""
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    input_dir = Path("/tmp/predict_input")
+    output_dir = Path("/tmp/predict_output")
+    input_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    src = VOL_RAW / DATASET_FOLDER_NAME / "imagesTr" / f"{case_id}_0000.nii.gz"
+    shutil.copyfile(src, input_dir / f"{case_id}_0000.nii.gz")
+
+    cmd = [
+        "nnUNetv2_predict",
+        "-i", str(input_dir), "-o", str(output_dir),
+        "-d", str(dataset_id), "-c", configuration,
+        "-f", *folds.split(","),
+        "-tr", trainer, "-p", plans,
+    ]
+    print("Running:", " ".join(cmd))
+    subprocess.run(cmd, check=True)
+
+    dest = Path(str(VOL_RESULTS)) / "predictions" / f"{case_id}.nii.gz"  # VOL_RESULTS is a PurePosixPath (no I/O methods)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(output_dir / f"{case_id}.nii.gz", dest)
+    results_vol.commit()
+    print(f"Wrote {dest}")
+    return str(dest)
+
+
+# ============================================================
 # 3. Train
 # ============================================================
 @app.function(
