@@ -19,6 +19,13 @@ const char* kShaderSource = R"hlsl(
 Texture3D<float> VolumeTex : register(t0);
 SamplerState VolumeSampler : register(s0);
 
+// Label volumes (ground truth / prediction): same grid as VolumeTex, one
+// byte-per-voxel id (0 = background) stored as UNORM8, decoded below.
+// Point-sampled (LabelSampler) so we never interpolate between label ids.
+Texture3D<float> GtLabelTex : register(t1);
+Texture3D<float> PredLabelTex : register(t2);
+SamplerState LabelSampler : register(s1);
+
 cbuffer RaycastCB : register(b0)
 {
     float3 cam_pos;     float aspect;
@@ -27,6 +34,11 @@ cbuffer RaycastCB : register(b0)
     float3 cam_forward; float pad0;
     float3 box_min;     float window_lo;
     float3 box_max;     float window_width;
+
+    float gt_enabled;   float gt_alpha;   uint gt_visible_mask;   float pad_gt;
+    float pred_enabled; float pred_alpha; uint pred_visible_mask; float pad_pred;
+    float4 gt_colors[16];
+    float4 pred_colors[16];
 };
 
 struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };
@@ -68,6 +80,28 @@ float4 PSMain(VSOut input) : SV_TARGET
             float sample_alpha = val * 0.12; // per-step opacity; tuned by eye for this transfer function
             accum.rgb += (1.0 - accum.a) * sample_alpha * val;
             accum.a += (1.0 - accum.a) * sample_alpha;
+
+            if (gt_enabled > 0.5)
+            {
+                uint label_id = (uint)round(GtLabelTex.SampleLevel(LabelSampler, uvw, 0) * 255.0);
+                if (label_id > 0 && label_id <= 16 && (gt_visible_mask & (1u << (label_id - 1))))
+                {
+                    float a = gt_alpha * 0.5;
+                    accum.rgb += (1.0 - accum.a) * a * gt_colors[label_id - 1].rgb;
+                    accum.a += (1.0 - accum.a) * a;
+                }
+            }
+            if (pred_enabled > 0.5)
+            {
+                uint label_id = (uint)round(PredLabelTex.SampleLevel(LabelSampler, uvw, 0) * 255.0);
+                if (label_id > 0 && label_id <= 16 && (pred_visible_mask & (1u << (label_id - 1))))
+                {
+                    float a = pred_alpha * 0.5;
+                    accum.rgb += (1.0 - accum.a) * a * pred_colors[label_id - 1].rgb;
+                    accum.a += (1.0 - accum.a) * a;
+                }
+            }
+
             t += step_size;
         }
     }
@@ -88,6 +122,11 @@ struct RaycastCB
     float cam_forward[3]; float pad0;
     float box_min[3];     float window_lo;
     float box_max[3];     float window_width;
+
+    float gt_enabled;   float gt_alpha;   uint32_t gt_visible_mask;   float pad_gt;
+    float pred_enabled; float pred_alpha; uint32_t pred_visible_mask; float pad_pred;
+    float gt_colors[16][4];
+    float pred_colors[16][4];
 };
 
 void Normalize3(float v[3])
@@ -165,6 +204,12 @@ bool InitRaycaster(ID3D11Device* device, const Volume& volume, Raycaster& out)
     if (FAILED(device->CreateSamplerState(&sampler_desc, &out.sampler)))
         return false;
 
+    D3D11_SAMPLER_DESC label_sampler_desc = {};
+    label_sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT; // never blend between label ids
+    label_sampler_desc.AddressU = label_sampler_desc.AddressV = label_sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    if (FAILED(device->CreateSamplerState(&label_sampler_desc, &out.label_sampler)))
+        return false;
+
     ID3DBlob* vs_blob = nullptr;
     ID3DBlob* ps_blob = nullptr;
     if (!CompileShader("VSMain", "vs_5_0", &vs_blob))
@@ -222,6 +267,53 @@ bool InitRaycaster(ID3D11Device* device, const Volume& volume, Raycaster& out)
     double dz = volume.nz * volume.spacing[2];
     out.distance = (float)std::sqrt(dx * dx + dy * dy + dz * dz) * 1.1f;
 
+    return true;
+}
+
+bool UploadLabelVolume(ID3D11Device* device, Raycaster& rc, const LabelVolume& labels,
+    const std::vector<std::array<uint8_t, 3>>& colors, bool is_prediction)
+{
+    ID3D11Texture3D** tex_slot = is_prediction ? &rc.pred_label_tex : &rc.gt_label_tex;
+    ID3D11ShaderResourceView** srv_slot = is_prediction ? &rc.pred_label_srv : &rc.gt_label_srv;
+    bool* has_slot = is_prediction ? &rc.has_pred_labels : &rc.has_gt_labels;
+    float (*color_slot)[4] = is_prediction ? rc.pred_colors : rc.gt_colors;
+
+    if (*srv_slot) { (*srv_slot)->Release(); *srv_slot = nullptr; }
+    if (*tex_slot) { (*tex_slot)->Release(); *tex_slot = nullptr; }
+    *has_slot = false;
+
+    D3D11_TEXTURE3D_DESC tex_desc = {};
+    tex_desc.Width = labels.nx;
+    tex_desc.Height = labels.ny;
+    tex_desc.Depth = labels.nz;
+    tex_desc.MipLevels = 1;
+    tex_desc.Format = DXGI_FORMAT_R8_UNORM; // stores id/255; shader decodes back with round(x*255)
+    tex_desc.Usage = D3D11_USAGE_IMMUTABLE;
+    tex_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+    D3D11_SUBRESOURCE_DATA init_data = {};
+    init_data.pSysMem = labels.data.data();
+    init_data.SysMemPitch = (UINT)labels.nx * sizeof(uint8_t);
+    init_data.SysMemSlicePitch = (UINT)labels.nx * labels.ny * sizeof(uint8_t);
+
+    if (FAILED(device->CreateTexture3D(&tex_desc, &init_data, tex_slot)))
+    {
+        fprintf(stderr, "UploadLabelVolume: CreateTexture3D failed\n");
+        return false;
+    }
+    if (FAILED(device->CreateShaderResourceView(*tex_slot, nullptr, srv_slot)))
+        return false;
+
+    int n = std::min((int)colors.size(), Raycaster::kMaxLabels);
+    for (int i = 0; i < n; ++i)
+    {
+        color_slot[i][0] = colors[i][0] / 255.0f;
+        color_slot[i][1] = colors[i][1] / 255.0f;
+        color_slot[i][2] = colors[i][2] / 255.0f;
+        color_slot[i][3] = 1.0f;
+    }
+
+    *has_slot = true;
     return true;
 }
 
@@ -284,7 +376,8 @@ bool ProjectToNDC(const CameraFrame& cam, const float world_point[3], float out_
     return true;
 }
 
-void RenderRaycast(ID3D11DeviceContext* context, Raycaster& rc, const Volume& volume, float window_width, float window_level)
+void RenderRaycast(ID3D11DeviceContext* context, Raycaster& rc, const Volume& volume, float window_width, float window_level,
+    const RaycastOverlayState& overlay)
 {
     CameraFrame cam = ComputeCameraFrame(rc, volume);
     memcpy(rc.basis_right, cam.right, sizeof(cam.right));
@@ -312,6 +405,17 @@ void RenderRaycast(ID3D11DeviceContext* context, Raycaster& rc, const Volume& vo
     for (int i = 0; i < 3; ++i) cb.box_max[i] = (float)box_max[i];
     cb.window_width = window_width / rc.hu_range;
 
+    bool gt_active = rc.has_gt_labels && overlay.gt_enabled;
+    bool pred_active = rc.has_pred_labels && overlay.pred_enabled;
+    cb.gt_enabled = gt_active ? 1.0f : 0.0f;
+    cb.gt_alpha = overlay.gt_alpha;
+    cb.gt_visible_mask = overlay.gt_visible_mask;
+    cb.pred_enabled = pred_active ? 1.0f : 0.0f;
+    cb.pred_alpha = overlay.pred_alpha;
+    cb.pred_visible_mask = overlay.pred_visible_mask;
+    memcpy(cb.gt_colors, rc.gt_colors, sizeof(cb.gt_colors));
+    memcpy(cb.pred_colors, rc.pred_colors, sizeof(cb.pred_colors));
+
     D3D11_MAPPED_SUBRESOURCE mapped;
     if (FAILED(context->Map(rc.constant_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
         return;
@@ -330,17 +434,24 @@ void RenderRaycast(ID3D11DeviceContext* context, Raycaster& rc, const Volume& vo
     context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     context->VSSetShader(rc.vertex_shader, nullptr, 0);
     context->PSSetShader(rc.pixel_shader, nullptr, 0);
-    context->PSSetShaderResources(0, 1, &rc.volume_srv);
-    context->PSSetSamplers(0, 1, &rc.sampler);
+    ID3D11ShaderResourceView* srvs[3] = { rc.volume_srv, gt_active ? rc.gt_label_srv : nullptr, pred_active ? rc.pred_label_srv : nullptr };
+    context->PSSetShaderResources(0, 3, srvs);
+    ID3D11SamplerState* samplers[2] = { rc.sampler, rc.label_sampler };
+    context->PSSetSamplers(0, 2, samplers);
     context->PSSetConstantBuffers(0, 1, &rc.constant_buffer);
     context->Draw(3, 0);
 
-    ID3D11ShaderResourceView* null_srv = nullptr;
-    context->PSSetShaderResources(0, 1, &null_srv); // unbind before it's next read as ImGui's Image source
+    ID3D11ShaderResourceView* null_srvs[3] = { nullptr, nullptr, nullptr };
+    context->PSSetShaderResources(0, 3, null_srvs); // unbind before target_srv is next read as ImGui's Image source
 }
 
 void ReleaseRaycaster(Raycaster& rc)
 {
+    if (rc.gt_label_srv) rc.gt_label_srv->Release();
+    if (rc.gt_label_tex) rc.gt_label_tex->Release();
+    if (rc.pred_label_srv) rc.pred_label_srv->Release();
+    if (rc.pred_label_tex) rc.pred_label_tex->Release();
+    if (rc.label_sampler) rc.label_sampler->Release();
     if (rc.target_srv) rc.target_srv->Release();
     if (rc.target_rtv) rc.target_rtv->Release();
     if (rc.target_tex) rc.target_tex->Release();

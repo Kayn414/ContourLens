@@ -68,6 +68,19 @@ static std::vector<std::array<uint8_t, 3>> BuildLabelColors(const std::vector<st
     return colors;
 }
 
+// Packs a per-structure visibility vector into a bitmask (bit i = label id
+// i+1), for the 3D raycaster's shader (see RaycastOverlayState) -- the 2D
+// panels use the vector directly, but a per-frame constant buffer needs a
+// fixed-size representation.
+static uint32_t PackVisibleMask(const std::vector<bool>& visible)
+{
+    uint32_t mask = 0;
+    for (size_t i = 0; i < visible.size() && i < 32; ++i)
+        if (visible[i])
+            mask |= (1u << i);
+    return mask;
+}
+
 // One Dice score per canonical structure (index = CanonIndexForStructureName),
 // NaN where that structure isn't present in both `gt` and `pred`'s label
 // lists or (rare) their names don't map to a canonical structure. Powers the
@@ -461,6 +474,13 @@ int main(int argc, char** argv)
     float window_width = 400.0f, window_level = 40.0f; // soft tissue preset, shared across planes
     bool k_dirty = true, j_dirty = true, i_dirty = true;
 
+    // Ctrl+wheel zoom, per panel (1 = fit-to-panel, same as before this
+    // existed). >1 displays the slice larger than the panel inside a
+    // scrolling child region, so the sliders/headers above it never resize
+    // or get pushed around by the zoom level.
+    float axial_zoom = 1.0f, coronal_zoom = 1.0f, sagittal_zoom = 1.0f;
+    const float kMinZoom = 1.0f, kMaxZoom = 8.0f;
+
     // OAR mask/contour overlay (source/export_gui_volume.py --export-masks).
     // Optional: the MPR panels just show plain CT if this fails to load.
     LabelVolume label_volume;
@@ -535,6 +555,8 @@ int main(int argc, char** argv)
         {
             label_visible.assign(label_volume.labels.size(), true);
             label_colors = BuildLabelColors(label_volume.labels);
+            if (raycaster_ok)
+                UploadLabelVolume(g_pd3dDevice, raycaster, label_volume, label_colors, false);
 
             DoseVolume dose_volume;
             bool real_dose_loaded = LoadDoseVolume(case_data_dir + "/dose", dose_volume);
@@ -575,6 +597,8 @@ int main(int argc, char** argv)
             prediction_label_visible.assign(prediction_volume.labels.size(), true);
             prediction_label_colors = BuildLabelColors(prediction_volume.labels);
             show_prediction_overlay = true; // matches show_overlays' always-on-when-loaded default
+            if (raycaster_ok)
+                UploadLabelVolume(g_pd3dDevice, raycaster, prediction_volume, prediction_label_colors, true);
         }
         if (masks_loaded && prediction_loaded)
             structure_dice = ComputePerStructureDice(label_volume, prediction_volume);
@@ -642,6 +666,8 @@ int main(int argc, char** argv)
                     prediction_label_colors = BuildLabelColors(prediction_volume.labels);
                     show_prediction_overlay = true;
                     k_dirty = j_dirty = i_dirty = true;
+                    if (raycaster_ok)
+                        UploadLabelVolume(g_pd3dDevice, raycaster, prediction_volume, prediction_label_colors, true);
                 }
                 if (masks_loaded && prediction_loaded)
                     structure_dice = ComputePerStructureDice(label_volume, prediction_volume);
@@ -701,8 +727,13 @@ int main(int argc, char** argv)
 
             if (ImGui::IsWindowHovered() && io.MouseWheel != 0.0f)
             {
-                cursor_k = std::clamp(cursor_k - (int)io.MouseWheel, 0, ct_volume.nz - 1);
-                k_dirty = true;
+                if (io.KeyCtrl)
+                    axial_zoom = std::clamp(axial_zoom * powf(1.1f, io.MouseWheel), kMinZoom, kMaxZoom);
+                else
+                {
+                    cursor_k = std::clamp(cursor_k - (int)io.MouseWheel, 0, ct_volume.nz - 1);
+                    k_dirty = true;
+                }
             }
 
             // W/L is shared across all views, so a change here dirties all of them.
@@ -784,7 +815,10 @@ int main(int argc, char** argv)
             }
 
             ImVec2 avail = ImGui::GetContentRegionAvail();
-            ImVec2 size = FitImageSize(avail, ct_volume.nx, ct_volume.ny, ct_volume.spacing[0], ct_volume.spacing[1]);
+            ImVec2 fit_size = FitImageSize(avail, ct_volume.nx, ct_volume.ny, ct_volume.spacing[0], ct_volume.spacing[1]);
+            ImVec2 size(fit_size.x * axial_zoom, fit_size.y * axial_zoom);
+
+            ImGui::BeginChild("AxialImageRegion", avail, false, ImGuiWindowFlags_HorizontalScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
             ImGui::Image((ImTextureID)(intptr_t)axial_srv, size);
 
             ImVec2 item_min = ImGui::GetItemRectMin();
@@ -796,6 +830,7 @@ int main(int argc, char** argv)
             }
             DrawCrosshairAndReadout(item_min, size, ct_volume.nx, ct_volume.ny, cursor_i, cursor_j, false,
                 ct_volume, cursor_i, cursor_j, cursor_k, cmp);
+            ImGui::EndChild();
         }
         else
         {
@@ -810,8 +845,13 @@ int main(int argc, char** argv)
 
             if (ImGui::IsWindowHovered() && io.MouseWheel != 0.0f)
             {
-                cursor_j = std::clamp(cursor_j - (int)io.MouseWheel, 0, ct_volume.ny - 1);
-                j_dirty = true;
+                if (io.KeyCtrl)
+                    coronal_zoom = std::clamp(coronal_zoom * powf(1.1f, io.MouseWheel), kMinZoom, kMaxZoom);
+                else
+                {
+                    cursor_j = std::clamp(cursor_j - (int)io.MouseWheel, 0, ct_volume.ny - 1);
+                    j_dirty = true;
+                }
             }
 
             if (j_dirty)
@@ -829,7 +869,10 @@ int main(int argc, char** argv)
             }
 
             ImVec2 avail = ImGui::GetContentRegionAvail();
-            ImVec2 size = FitImageSize(avail, ct_volume.nx, ct_volume.nz, ct_volume.spacing[0], ct_volume.spacing[2]);
+            ImVec2 fit_size = FitImageSize(avail, ct_volume.nx, ct_volume.nz, ct_volume.spacing[0], ct_volume.spacing[2]);
+            ImVec2 size(fit_size.x * coronal_zoom, fit_size.y * coronal_zoom);
+
+            ImGui::BeginChild("CoronalImageRegion", avail, false, ImGuiWindowFlags_HorizontalScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
             ImGui::Image((ImTextureID)(intptr_t)coronal_srv, size, ImVec2(0, 1), ImVec2(1, 0));
 
             ImVec2 item_min = ImGui::GetItemRectMin();
@@ -841,6 +884,7 @@ int main(int argc, char** argv)
             }
             DrawCrosshairAndReadout(item_min, size, ct_volume.nx, ct_volume.nz, cursor_i, cursor_k, true,
                 ct_volume, cursor_i, cursor_j, cursor_k, cmp);
+            ImGui::EndChild();
         }
         else
         {
@@ -855,8 +899,13 @@ int main(int argc, char** argv)
 
             if (ImGui::IsWindowHovered() && io.MouseWheel != 0.0f)
             {
-                cursor_i = std::clamp(cursor_i - (int)io.MouseWheel, 0, ct_volume.nx - 1);
-                i_dirty = true;
+                if (io.KeyCtrl)
+                    sagittal_zoom = std::clamp(sagittal_zoom * powf(1.1f, io.MouseWheel), kMinZoom, kMaxZoom);
+                else
+                {
+                    cursor_i = std::clamp(cursor_i - (int)io.MouseWheel, 0, ct_volume.nx - 1);
+                    i_dirty = true;
+                }
             }
 
             if (i_dirty)
@@ -874,7 +923,10 @@ int main(int argc, char** argv)
             }
 
             ImVec2 avail = ImGui::GetContentRegionAvail();
-            ImVec2 size = FitImageSize(avail, ct_volume.ny, ct_volume.nz, ct_volume.spacing[1], ct_volume.spacing[2]);
+            ImVec2 fit_size = FitImageSize(avail, ct_volume.ny, ct_volume.nz, ct_volume.spacing[1], ct_volume.spacing[2]);
+            ImVec2 size(fit_size.x * sagittal_zoom, fit_size.y * sagittal_zoom);
+
+            ImGui::BeginChild("SagittalImageRegion", avail, false, ImGuiWindowFlags_HorizontalScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
             ImGui::Image((ImTextureID)(intptr_t)sagittal_srv, size, ImVec2(0, 1), ImVec2(1, 0));
 
             ImVec2 item_min = ImGui::GetItemRectMin();
@@ -886,6 +938,7 @@ int main(int argc, char** argv)
             }
             DrawCrosshairAndReadout(item_min, size, ct_volume.ny, ct_volume.nz, cursor_j, cursor_k, true,
                 ct_volume, cursor_i, cursor_j, cursor_k, cmp);
+            ImGui::EndChild();
         }
         else
         {
@@ -915,7 +968,14 @@ int main(int argc, char** argv)
             if (ImGui::IsWindowHovered() && io.MouseWheel != 0.0f)
                 raycaster.distance = std::clamp(raycaster.distance * powf(0.9f, io.MouseWheel), 50.0f, 5000.0f);
 
-            RenderRaycast(g_pd3dDeviceContext, raycaster, ct_volume, window_width, window_level);
+            RaycastOverlayState raycast_overlay;
+            raycast_overlay.gt_enabled = show_overlays;
+            raycast_overlay.gt_alpha = overlay_alpha;
+            raycast_overlay.gt_visible_mask = PackVisibleMask(label_visible);
+            raycast_overlay.pred_enabled = show_prediction_overlay;
+            raycast_overlay.pred_alpha = prediction_overlay_alpha;
+            raycast_overlay.pred_visible_mask = PackVisibleMask(prediction_label_visible);
+            RenderRaycast(g_pd3dDeviceContext, raycaster, ct_volume, window_width, window_level, raycast_overlay);
 
             ImGui::Checkbox("Show slice planes", &show_slice_planes);
             ImGui::SameLine();
