@@ -1,0 +1,55 @@
+[project]
+name = "source"
+version = "26.0.0"
+description = "dicom_rt"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "einops>=0.8",      # tensor operations
+    "einx>=0.4",        # more general tensor operations
+    "jaxtyping>=0.3",   # type hints for pytorch/jax/numpy
+    "numpy>=2.4",
+    "psutil>=7",
+    "pytest>=9.0",
+    "pytest-timeout",
+    "regex>=2026.3.32", # more powerful regex than the builtin `re` module
+    "tiktoken>=0.12.0",
+    "torch~=2.11.0",
+    "tqdm>=4.67",
+    "wandb>=0.25",
+    "ty>=0.0.26",
+    "ruff>=0.15.8",
+    "datasets>=5.0.1",
+    "matplotlib>=3.11.1",
+    "pydicom>=3.0.2",
+    "simpleitk>=2.5.6",
+    "nibabel>=5.4.2",
+    "rt-utils>=1.2.7",
+    "nnunetv2>=2.8.1",
+    "modal>=1.5.5",
+    "torchvision>=0.26.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.0,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "source"
+module-root = ""
+
+[tool.uv]
+package = true
+python-preference = "managed"
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchvision = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true

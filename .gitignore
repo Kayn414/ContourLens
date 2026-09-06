@@ -1,0 +1,19 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.ruff_cache/
+*.egg-info/
+
+# Generated artifacts
+ct_slice.png
+imgui.ini
+
+# C++ / CMake build output
+gui/build/
+gui/out/
+build/
+out/
+
+# Data (large / externally-sourced fixtures - see data/SlicerRtData/Links.txt)
+data/
