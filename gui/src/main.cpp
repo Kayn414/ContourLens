@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <functional>
+#include <limits>
 #include <vector>
 #include <d3d11.h>
 #include <tchar.h>
@@ -39,12 +40,19 @@ static const uint8_t kCanonicalStructureColors[][3] = {
 };
 static const int kNumCanonicalStructures = sizeof(kCanonicalStructureNames) / sizeof(kCanonicalStructureNames[0]);
 
-static const uint8_t* ColorForStructureName(const std::string& name)
+// -1 if `name` isn't one of the canonical structures (e.g. an unexpected label).
+static int CanonIndexForStructureName(const std::string& name)
 {
     for (int i = 0; i < kNumCanonicalStructures; ++i)
         if (name == kCanonicalStructureNames[i])
-            return kCanonicalStructureColors[i];
-    return kCanonicalStructureColors[kNumCanonicalStructures - 1];
+            return i;
+    return -1;
+}
+
+static const uint8_t* ColorForStructureName(const std::string& name)
+{
+    int i = CanonIndexForStructureName(name);
+    return kCanonicalStructureColors[i >= 0 ? i : kNumCanonicalStructures - 1];
 }
 
 // Precomputed per-label-id (index = id - 1) colors for one label volume, so
@@ -58,6 +66,47 @@ static std::vector<std::array<uint8_t, 3>> BuildLabelColors(const std::vector<st
         colors[i] = { c[0], c[1], c[2] };
     }
     return colors;
+}
+
+// One Dice score per canonical structure (index = CanonIndexForStructureName),
+// NaN where that structure isn't present in both `gt` and `pred`'s label
+// lists or (rare) their names don't map to a canonical structure. Powers the
+// crosshair readout's "how good is the model here" line -- computed once
+// (a full-volume pass) whenever both are loaded/reloaded, never per frame.
+static std::vector<float> ComputePerStructureDice(const LabelVolume& gt, const LabelVolume& pred)
+{
+    std::vector<float> dice(kNumCanonicalStructures, std::numeric_limits<float>::quiet_NaN());
+    if (gt.nx != pred.nx || gt.ny != pred.ny || gt.nz != pred.nz || gt.data.empty())
+        return dice;
+
+    std::vector<int> gt_id_to_canon(gt.labels.size() + 1, -1);   // index 0 (background) stays -1
+    for (size_t i = 0; i < gt.labels.size(); ++i)
+        gt_id_to_canon[i + 1] = CanonIndexForStructureName(gt.labels[i]);
+
+    std::vector<int> pred_id_to_canon(pred.labels.size() + 1, -1);
+    for (size_t i = 0; i < pred.labels.size(); ++i)
+        pred_id_to_canon[i + 1] = CanonIndexForStructureName(pred.labels[i]);
+
+    std::vector<size_t> gt_count(kNumCanonicalStructures, 0);
+    std::vector<size_t> pred_count(kNumCanonicalStructures, 0);
+    std::vector<size_t> intersection(kNumCanonicalStructures, 0);
+
+    for (size_t v = 0; v < gt.data.size(); ++v)
+    {
+        int gt_canon = gt.data[v] < gt_id_to_canon.size() ? gt_id_to_canon[gt.data[v]] : -1;
+        int pred_canon = pred.data[v] < pred_id_to_canon.size() ? pred_id_to_canon[pred.data[v]] : -1;
+        if (gt_canon >= 0) gt_count[gt_canon]++;
+        if (pred_canon >= 0) pred_count[pred_canon]++;
+        if (gt_canon >= 0 && gt_canon == pred_canon) intersection[gt_canon]++;
+    }
+
+    for (int c = 0; c < kNumCanonicalStructures; ++c)
+    {
+        size_t denom = gt_count[c] + pred_count[c];
+        if (denom > 0)
+            dice[c] = 2.0f * (float)intersection[c] / (float)denom;
+    }
+    return dice;
 }
 
 static ID3D11Device* g_pd3dDevice = nullptr;
@@ -223,28 +272,101 @@ static bool PanelClicked(ImVec2 item_min, ImVec2 item_size, int tex_w, int tex_h
     return true;
 }
 
+// Ground-truth/prediction context for the crosshair readout's second line.
+// Bundled into one struct rather than five parameters since all three MPR
+// panels pass the exact same values, only the voxel coordinates differ.
+struct StructureComparisonContext
+{
+    bool masks_loaded = false;
+    const LabelVolume* label_volume = nullptr;      // ground truth
+    bool prediction_loaded = false;
+    const LabelVolume* prediction_volume = nullptr;
+    const std::vector<float>* structure_dice = nullptr; // indexed by CanonIndexForStructureName
+};
+
 // Crosshair through the shared cursor voxel (ci, cj, ck), projected into
-// this panel's (col, row) in-plane coordinates, plus an (i,j,k)/HU readout.
+// this panel's (col, row) in-plane coordinates, plus an (i,j,k)/HU readout
+// and, when ground truth and/or a prediction are loaded, a second line
+// showing what each says is at the cursor and that structure's Dice score.
 static void DrawCrosshairAndReadout(ImVec2 item_min, ImVec2 item_size, int tex_w, int tex_h, int col, int row, bool flipped,
-    const Volume& vol, int ci, int cj, int ck)
+    const Volume& vol, int ci, int cj, int ck, const StructureComparisonContext& cmp)
 {
     int display_row = flipped ? (tex_h - 1 - row) : row;
     float sx = item_min.x + ((float)col + 0.5f) / tex_w * item_size.x;
     float sy = item_min.y + ((float)display_row + 0.5f) / tex_h * item_size.y;
 
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
-    const ImU32 color = IM_COL32(255, 230, 0, 180);
-    draw_list->AddLine(ImVec2(sx, item_min.y), ImVec2(sx, item_min.y + item_size.y), color);
-    draw_list->AddLine(ImVec2(item_min.x, sy), ImVec2(item_min.x + item_size.x, sy), color);
+    const ImU32 crosshair_color = IM_COL32(255, 230, 0, 180);
+    draw_list->AddLine(ImVec2(sx, item_min.y), ImVec2(sx, item_min.y + item_size.y), crosshair_color);
+    draw_list->AddLine(ImVec2(item_min.x, sy), ImVec2(item_min.x + item_size.x, sy), crosshair_color);
 
-    // Drawn as an overlay on the image (not a separate ImGui::Text line) so it
+    // Drawn as an overlay on the image (not separate ImGui::Text lines) so it
     // can't push the panel's content past the dock quadrant's fixed height.
-    char buf[64];
-    snprintf(buf, sizeof(buf), "(i=%d, j=%d, k=%d)  HU=%d", ci, cj, ck, vol.At(ci, cj, ck));
+    char line1[64];
+    snprintf(line1, sizeof(line1), "(i=%d, j=%d, k=%d)  HU=%d", ci, cj, ck, vol.At(ci, cj, ck));
+    ImVec2 line1_size = ImGui::CalcTextSize(line1);
+
+    char line2[128];
+    bool have_line2 = cmp.masks_loaded || cmp.prediction_loaded;
+    ImU32 line2_color = IM_COL32(220, 220, 220, 255);
+    if (have_line2)
+    {
+        std::string gt_name = "-", pred_name = "-";
+        int gt_canon = -1, pred_canon = -1;
+        if (cmp.masks_loaded)
+        {
+            uint8_t id = cmp.label_volume->At(ci, cj, ck);
+            gt_name = id == 0 ? "background" : cmp.label_volume->labels[id - 1];
+            gt_canon = id == 0 ? -1 : CanonIndexForStructureName(gt_name);
+        }
+        if (cmp.prediction_loaded)
+        {
+            uint8_t id = cmp.prediction_volume->At(ci, cj, ck);
+            pred_name = id == 0 ? "background" : cmp.prediction_volume->labels[id - 1];
+            pred_canon = id == 0 ? -1 : CanonIndexForStructureName(pred_name);
+        }
+
+        if (!cmp.masks_loaded)
+            line2_color = IM_COL32(220, 220, 220, 255); // prediction only, nothing to compare against
+        else if (!cmp.prediction_loaded)
+            line2_color = IM_COL32(220, 220, 220, 255); // ground truth only, ditto
+        else if (gt_canon == -1 && pred_canon == -1)
+            line2_color = IM_COL32(180, 180, 180, 255); // both background - not interesting either way
+        else if (gt_canon == pred_canon)
+            line2_color = IM_COL32(90, 220, 130, 255);  // agree on a real structure
+        else
+            line2_color = IM_COL32(230, 90, 90, 255);   // disagree (false positive/negative here)
+
+        int relevant_canon = gt_canon >= 0 ? gt_canon : pred_canon;
+        float dice_val = (relevant_canon >= 0 && cmp.structure_dice && relevant_canon < (int)cmp.structure_dice->size())
+            ? (*cmp.structure_dice)[relevant_canon] : std::numeric_limits<float>::quiet_NaN();
+
+        if (cmp.masks_loaded && cmp.prediction_loaded)
+        {
+            if (!std::isnan(dice_val))
+                snprintf(line2, sizeof(line2), "GT: %s  Pred: %s  Dice: %.2f", gt_name.c_str(), pred_name.c_str(), dice_val);
+            else
+                snprintf(line2, sizeof(line2), "GT: %s  Pred: %s", gt_name.c_str(), pred_name.c_str());
+        }
+        else if (cmp.masks_loaded)
+            snprintf(line2, sizeof(line2), "GT: %s", gt_name.c_str());
+        else
+            snprintf(line2, sizeof(line2), "Pred: %s", pred_name.c_str());
+    }
+
     ImVec2 text_pos(item_min.x + 4.0f, item_min.y + 4.0f);
-    ImVec2 text_size = ImGui::CalcTextSize(buf);
-    draw_list->AddRectFilled(text_pos, ImVec2(text_pos.x + text_size.x + 4.0f, text_pos.y + text_size.y + 4.0f), IM_COL32(0, 0, 0, 160));
-    draw_list->AddText(ImVec2(text_pos.x + 2.0f, text_pos.y + 2.0f), IM_COL32(255, 255, 255, 255), buf);
+    ImVec2 box_size = line1_size;
+    ImVec2 line2_size(0, 0);
+    if (have_line2)
+    {
+        line2_size = ImGui::CalcTextSize(line2);
+        box_size.x = std::max(box_size.x, line2_size.x);
+        box_size.y += line2_size.y + 2.0f;
+    }
+    draw_list->AddRectFilled(text_pos, ImVec2(text_pos.x + box_size.x + 4.0f, text_pos.y + box_size.y + 4.0f), IM_COL32(0, 0, 0, 160));
+    draw_list->AddText(ImVec2(text_pos.x + 2.0f, text_pos.y + 2.0f), IM_COL32(255, 255, 255, 255), line1);
+    if (have_line2)
+        draw_list->AddText(ImVec2(text_pos.x + 2.0f, text_pos.y + 2.0f + line1_size.y + 2.0f), line2_color, line2);
 }
 
 // Draws one slice plane's outline (+ a faint fill) into the 3D raycast
@@ -360,6 +482,11 @@ int main(int argc, char** argv)
     std::vector<std::array<uint8_t, 3>> prediction_label_colors;
     InferenceJob inference_job;
 
+    // Per-structure Dice (ground truth vs. prediction), for the crosshair
+    // readout's accuracy line. Recomputed (full-volume pass, so not every
+    // frame) whenever both are loaded/reloaded.
+    std::vector<float> structure_dice;
+
     // Raycast 3D panel.
     Raycaster raycaster;
     bool raycaster_ok = false;
@@ -449,6 +576,8 @@ int main(int argc, char** argv)
             prediction_label_colors = BuildLabelColors(prediction_volume.labels);
             show_prediction_overlay = true; // matches show_overlays' always-on-when-loaded default
         }
+        if (masks_loaded && prediction_loaded)
+            structure_dice = ComputePerStructureDice(label_volume, prediction_volume);
     }
     else
     {
@@ -514,6 +643,8 @@ int main(int argc, char** argv)
                     show_prediction_overlay = true;
                     k_dirty = j_dirty = i_dirty = true;
                 }
+                if (masks_loaded && prediction_loaded)
+                    structure_dice = ComputePerStructureDice(label_volume, prediction_volume);
             }
             else
             {
@@ -543,6 +674,13 @@ int main(int argc, char** argv)
         }
         if (overlay_toggled_from_menu)
             k_dirty = j_dirty = i_dirty = true;
+
+        StructureComparisonContext cmp;
+        cmp.masks_loaded = masks_loaded;
+        cmp.label_volume = &label_volume;
+        cmp.prediction_loaded = prediction_loaded;
+        cmp.prediction_volume = &prediction_volume;
+        cmp.structure_dice = &structure_dice;
 
         ImGui::Begin("Axial");
         if (ct_loaded)
@@ -657,7 +795,7 @@ int main(int argc, char** argv)
                 j_dirty = i_dirty = true; // coronal/sagittal now pass through a different point
             }
             DrawCrosshairAndReadout(item_min, size, ct_volume.nx, ct_volume.ny, cursor_i, cursor_j, false,
-                ct_volume, cursor_i, cursor_j, cursor_k);
+                ct_volume, cursor_i, cursor_j, cursor_k, cmp);
         }
         else
         {
@@ -702,7 +840,7 @@ int main(int argc, char** argv)
                 i_dirty = k_dirty = true;
             }
             DrawCrosshairAndReadout(item_min, size, ct_volume.nx, ct_volume.nz, cursor_i, cursor_k, true,
-                ct_volume, cursor_i, cursor_j, cursor_k);
+                ct_volume, cursor_i, cursor_j, cursor_k, cmp);
         }
         else
         {
@@ -747,7 +885,7 @@ int main(int argc, char** argv)
                 j_dirty = k_dirty = true;
             }
             DrawCrosshairAndReadout(item_min, size, ct_volume.ny, ct_volume.nz, cursor_j, cursor_k, true,
-                ct_volume, cursor_i, cursor_j, cursor_k);
+                ct_volume, cursor_i, cursor_j, cursor_k, cmp);
         }
         else
         {
