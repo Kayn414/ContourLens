@@ -17,9 +17,21 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(json)
 
+# ImPlot ships no CMakeLists.txt (same as imgui) -- FetchContent_MakeAvailable
+# just populates the source dir without add_subdirectory-ing it; compile its
+# .cpp files directly like the imgui ones below.
+FetchContent_Declare(
+  implot
+  GIT_REPOSITORY https://github.com/epezent/implot.git
+  GIT_TAG        v1.0
+)
+FetchContent_MakeAvailable(implot)
+
 add_executable(dicom_rt_gui
   src/main.cpp
   src/volume.cpp
+  src/raycaster.cpp
+  src/dvh.cpp
   ${imgui_SOURCE_DIR}/imgui.cpp
   ${imgui_SOURCE_DIR}/imgui_draw.cpp
   ${imgui_SOURCE_DIR}/imgui_tables.cpp
@@ -27,11 +39,14 @@ add_executable(dicom_rt_gui
   ${imgui_SOURCE_DIR}/imgui_demo.cpp
   ${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp
   ${imgui_SOURCE_DIR}/backends/imgui_impl_dx11.cpp
+  ${implot_SOURCE_DIR}/implot.cpp
+  ${implot_SOURCE_DIR}/implot_items.cpp
 )
 
 target_include_directories(dicom_rt_gui PRIVATE
   ${imgui_SOURCE_DIR}
   ${imgui_SOURCE_DIR}/backends
+  ${implot_SOURCE_DIR}
 )
 
 target_link_libraries(dicom_rt_gui PRIVATE d3d11.lib dxgi.lib d3dcompiler.lib nlohmann_json::nlohmann_json)

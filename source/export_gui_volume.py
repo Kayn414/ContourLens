@@ -22,10 +22,12 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pydicom
 import SimpleITK as sitk
 
 DEFAULT_CT = Path("data/phantom/nnunet_input/phantom_ent_0000.nii.gz")
 DEFAULT_OUT_DIR = Path("data/phantom/gui_export")
+DEFAULT_MASKS_DIR = Path("data/phantom/masks")
 
 
 def export_volume(nifti_path: Path, out_dir: Path, name: str) -> None:
@@ -54,14 +56,102 @@ def export_volume(nifti_path: Path, out_dir: Path, name: str) -> None:
     print(f"{nifti_path} -> {bin_path} ({array.nbytes:,} bytes), {json_path}")
 
 
+def export_label_volume(mask_dir: Path, reference_nifti: Path, out_dir: Path, name: str) -> None:
+    """Combine every *.nii.gz binary mask in `mask_dir` into one uint8
+    multi-label volume on the reference CT's grid (id = sorted-filename index
+    + 1, 0 = background), + a JSON sidecar carrying id -> name via `labels`
+    (labels[id - 1] == name). Masks are assumed already on that same grid
+    (true for data/phantom/masks/, all built from the same CT read) --
+    mismatched shapes raise rather than silently misalign.
+    """
+    reference = sitk.ReadImage(str(reference_nifti))
+    ref_shape = sitk.GetArrayFromImage(reference).shape  # (z, y, x)
+
+    mask_paths = sorted(mask_dir.glob("*.nii.gz"))
+    if not mask_paths:
+        raise FileNotFoundError(f"No *.nii.gz masks found in {mask_dir}")
+
+    label_array = np.zeros(ref_shape, dtype=np.uint8)
+    labels: list[str] = []
+    for mask_path in mask_paths:
+        mask_array = sitk.GetArrayFromImage(sitk.ReadImage(str(mask_path)))
+        if mask_array.shape != ref_shape:
+            raise ValueError(f"{mask_path.name}: shape {mask_array.shape} != reference shape {ref_shape}")
+        labels.append(mask_path.name.removesuffix(".nii.gz"))
+        label_array[mask_array > 0] = len(labels)  # id = 1-based index just appended
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    bin_path = out_dir / f"{name}.bin"
+    json_path = out_dir / f"{name}.json"
+
+    label_array.tofile(bin_path)
+    json_path.write_text(json.dumps({
+        "shape": list(label_array.shape),
+        "dtype": "uint8",
+        "spacing": list(reference.GetSpacing()),
+        "origin": list(reference.GetOrigin()),
+        "direction": list(reference.GetDirection()),
+        "labels": labels,
+    }, indent=2))
+
+    print(f"{mask_dir} ({len(labels)} structures: {', '.join(labels)}) -> {bin_path}, {json_path}")
+
+
+def export_dose(dose_dicom_path: Path, reference_nifti: Path, out_dir: Path, name: str = "dose") -> None:
+    """Read an RTDOSE DICOM file, apply DoseGridScaling (SimpleITK's DICOM
+    reader does NOT do this automatically -- it's an RT-specific tag, not the
+    standard RescaleSlope/Intercept), resample onto the reference CT's grid
+    (RTDOSE is usually coarser/offset from the CT), and dump as float32 Gy.
+    """
+    reference = sitk.ReadImage(str(reference_nifti))
+
+    dose_image = sitk.Cast(sitk.ReadImage(str(dose_dicom_path)), sitk.sitkFloat32)
+    scaling = float(pydicom.dcmread(str(dose_dicom_path), stop_before_pixels=True).DoseGridScaling)
+    dose_image *= scaling
+
+    if (dose_image.GetSize() != reference.GetSize()
+            or dose_image.GetSpacing() != reference.GetSpacing()
+            or dose_image.GetOrigin() != reference.GetOrigin()):
+        resampler = sitk.ResampleImageFilter()
+        resampler.SetReferenceImage(reference)
+        resampler.SetInterpolator(sitk.sitkLinear)
+        resampler.SetDefaultPixelValue(0.0)
+        dose_image = resampler.Execute(dose_image)
+
+    array = sitk.GetArrayFromImage(dose_image).astype("<f4")  # (z, y, x) float32 Gy
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    bin_path = out_dir / f"{name}.bin"
+    json_path = out_dir / f"{name}.json"
+
+    array.tofile(bin_path)
+    json_path.write_text(json.dumps({
+        "shape": list(array.shape),
+        "dtype": "float32",
+        "spacing": list(reference.GetSpacing()),
+        "origin": list(reference.GetOrigin()),
+        "direction": list(reference.GetDirection()),
+    }, indent=2))
+
+    print(f"{dose_dicom_path} (x{scaling} Gy/unit) -> {bin_path} ({array.nbytes:,} bytes), {json_path}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--nifti", type=Path, default=DEFAULT_CT)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--name", default="ct")
+    parser.add_argument("--export-masks", action="store_true", help="Export the combined OAR label volume instead of the CT.")
+    parser.add_argument("--masks-dir", type=Path, default=DEFAULT_MASKS_DIR)
+    parser.add_argument("--dose", type=Path, help="Path to an RTDOSE DICOM file; exports it instead of the CT/masks.")
     args = parser.parse_args()
 
-    export_volume(args.nifti, args.out_dir, args.name)
+    if args.dose:
+        export_dose(args.dose, args.nifti, args.out_dir, "dose" if args.name == "ct" else args.name)
+    elif args.export_masks:
+        export_label_volume(args.masks_dir, args.nifti, args.out_dir, "masks" if args.name == "ct" else args.name)
+    else:
+        export_volume(args.nifti, args.out_dir, args.name)
 
 
 if __name__ == "__main__":

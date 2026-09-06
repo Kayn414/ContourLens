@@ -66,3 +66,106 @@ bool LoadVolume(const std::string& base_path, Volume& out)
     out = std::move(volume);
     return true;
 }
+
+bool LoadLabelVolume(const std::string& base_path, LabelVolume& out)
+{
+    std::ifstream json_file(base_path + ".json");
+    if (!json_file)
+    {
+        std::cerr << "LoadLabelVolume: cannot open " << base_path << ".json\n";
+        return false;
+    }
+
+    nlohmann::json j;
+    json_file >> j;
+
+    auto shape = j.at("shape").get<std::vector<int>>(); // (nz, ny, nx)
+    if (shape.size() != 3)
+    {
+        std::cerr << "LoadLabelVolume: expected \"shape\" of length 3\n";
+        return false;
+    }
+
+    std::string dtype = j.at("dtype").get<std::string>();
+    if (dtype != "uint8")
+    {
+        std::cerr << "LoadLabelVolume: unsupported dtype \"" << dtype << "\" (only uint8 is implemented)\n";
+        return false;
+    }
+
+    std::ifstream bin_file(base_path + ".bin", std::ios::binary);
+    if (!bin_file)
+    {
+        std::cerr << "LoadLabelVolume: cannot open " << base_path << ".bin\n";
+        return false;
+    }
+
+    LabelVolume labels;
+    labels.nz = shape[0];
+    labels.ny = shape[1];
+    labels.nx = shape[2];
+    labels.labels = j.at("labels").get<std::vector<std::string>>();
+
+    size_t voxel_count = (size_t)labels.nx * labels.ny * labels.nz;
+    labels.data.resize(voxel_count);
+    bin_file.read(reinterpret_cast<char*>(labels.data.data()), voxel_count * sizeof(uint8_t));
+    if (!bin_file)
+    {
+        std::cerr << "LoadLabelVolume: " << base_path << ".bin is smaller than the " << voxel_count << " voxels shape implies\n";
+        return false;
+    }
+
+    out = std::move(labels);
+    return true;
+}
+
+bool LoadDoseVolume(const std::string& base_path, DoseVolume& out)
+{
+    std::ifstream json_file(base_path + ".json");
+    if (!json_file)
+    {
+        std::cerr << "LoadDoseVolume: cannot open " << base_path << ".json\n";
+        return false;
+    }
+
+    nlohmann::json j;
+    json_file >> j;
+
+    auto shape = j.at("shape").get<std::vector<int>>(); // (nz, ny, nx)
+    if (shape.size() != 3)
+    {
+        std::cerr << "LoadDoseVolume: expected \"shape\" of length 3\n";
+        return false;
+    }
+
+    std::string dtype = j.at("dtype").get<std::string>();
+    if (dtype != "float32")
+    {
+        std::cerr << "LoadDoseVolume: unsupported dtype \"" << dtype << "\" (only float32 is implemented)\n";
+        return false;
+    }
+
+    std::ifstream bin_file(base_path + ".bin", std::ios::binary);
+    if (!bin_file)
+    {
+        std::cerr << "LoadDoseVolume: cannot open " << base_path << ".bin\n";
+        return false;
+    }
+
+    DoseVolume dose;
+    dose.nz = shape[0];
+    dose.ny = shape[1];
+    dose.nx = shape[2];
+
+    size_t voxel_count = (size_t)dose.nx * dose.ny * dose.nz;
+    dose.data.resize(voxel_count);
+    bin_file.read(reinterpret_cast<char*>(dose.data.data()), voxel_count * sizeof(float));
+    if (!bin_file)
+    {
+        std::cerr << "LoadDoseVolume: " << base_path << ".bin is smaller than the " << voxel_count << " voxels shape implies\n";
+        return false;
+    }
+
+    out = std::move(dose);
+    return true;
+}
