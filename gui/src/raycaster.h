@@ -36,7 +36,15 @@ struct Raycaster
     float azimuth = 0.7f;
     float elevation = 0.35f;
     float distance = 600.0f;
+    float default_distance = 600.0f; // set once in InitRaycaster; Space resets `distance` back to this
     float target_offset[3] = { 0.0f, 0.0f, 0.0f }; // right-drag pan, added to the volume-center look-at point
+
+    // Axis lock (double-click a slice plane in the 3D panel): -1 = free
+    // orbit via azimuth/elevation above; 0/1/2 = locked to rotate purely
+    // around world X/Y/Z (sagittal/coronal/axial plane normal respectively),
+    // parameterized by locked_angle instead. See ComputeCameraFrame.
+    int locked_axis = -1;
+    float locked_angle = 0.0f;
 
     // Camera right/up basis from the most recent RenderRaycast call, in world
     // mm -- the 3D panel's right-drag pan handler reads these (one frame

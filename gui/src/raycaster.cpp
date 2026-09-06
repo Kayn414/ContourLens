@@ -142,6 +142,19 @@ void Cross3(const float a[3], const float b[3], float out[3])
     out[2] = a[0] * b[1] - a[1] * b[0];
 }
 
+// Rodrigues' rotation formula, specialized for k a unit basis vector and v
+// perpendicular to k (both true for how ComputeCameraFrame calls this), so
+// the k*(k.v) term the general formula needs drops out: v_rot = v*cos(theta) + (k x v)*sin(theta).
+void RotateAroundAxis(const float v[3], const float k[3], float theta, float out[3])
+{
+    float kxv[3];
+    Cross3(k, v, kxv);
+    float c = cosf(theta), s = sinf(theta);
+    out[0] = v[0] * c + kxv[0] * s;
+    out[1] = v[1] * c + kxv[1] * s;
+    out[2] = v[2] * c + kxv[2] * s;
+}
+
 bool CompileShader(const char* entry_point, const char* target, ID3DBlob** out_blob)
 {
     ID3DBlob* error_blob = nullptr;
@@ -265,7 +278,7 @@ bool InitRaycaster(ID3D11Device* device, const Volume& volume, Raycaster& out)
     double dx = volume.nx * volume.spacing[0];
     double dy = volume.ny * volume.spacing[1];
     double dz = volume.nz * volume.spacing[2];
-    out.distance = (float)std::sqrt(dx * dx + dy * dy + dz * dz) * 1.1f;
+    out.distance = out.default_distance = (float)std::sqrt(dx * dx + dy * dy + dz * dz) * 1.1f;
 
     return true;
 }
@@ -331,9 +344,27 @@ CameraFrame ComputeCameraFrame(const Raycaster& rc, const Volume& volume)
         (float)((box_min[2] + box_max[2]) * 0.5) + rc.target_offset[2],
     };
 
-    float ce = cosf(rc.elevation), se = sinf(rc.elevation);
-    float ca = cosf(rc.azimuth), sa = sinf(rc.azimuth);
-    float dir[3] = { ce * ca, ce * sa, se }; // spherical, +z (superior) as the pole
+    float dir[3];
+    if (rc.locked_axis < 0)
+    {
+        float ce = cosf(rc.elevation), se = sinf(rc.elevation);
+        float ca = cosf(rc.azimuth), sa = sinf(rc.azimuth);
+        dir[0] = ce * ca; dir[1] = ce * sa; dir[2] = se; // spherical, +z (superior) as the pole
+    }
+    else
+    {
+        // Locked to spin purely around world X/Y/Z (rc.locked_axis 0/1/2):
+        // rotate a fixed reference vector (perpendicular to that axis) by
+        // locked_angle. X and Y share reference (0,0,1) is parallel to the
+        // Y... no: X's axis is (1,0,0) so (0,0,1) is perpendicular to it;
+        // same reference works for Y's axis (0,1,0). Z needs a different
+        // reference since (0,0,1) IS its axis.
+        float axis[3] = { 0.0f, 0.0f, 0.0f };
+        axis[rc.locked_axis] = 1.0f;
+        float reference[3] = { 0.0f, 0.0f, 1.0f };
+        if (rc.locked_axis == 2) { reference[0] = 1.0f; reference[1] = 0.0f; reference[2] = 0.0f; }
+        RotateAroundAxis(reference, axis, rc.locked_angle, dir);
+    }
 
     CameraFrame frame = {};
     frame.pos[0] = center[0] + rc.distance * dir[0];

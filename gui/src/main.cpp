@@ -135,8 +135,8 @@ void CreateRenderTarget();
 void CleanupRenderTarget();
 LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
-// Eclipse-style 4-panel MPR layout: axial | coronal
-//                                   sagittal | 3D
+// Controls sidebar | Eclipse-style 2x2 MPR layout (axial | coronal
+//                                                   sagittal | 3D)
 // Built once (not every frame, or user drags get wiped). Layout is fixed for
 // now (io.IniFilename == nullptr) rather than user-re-dockable + persisted.
 static void BuildDockLayout(ImGuiID dockspace_id)
@@ -145,8 +145,11 @@ static void BuildDockLayout(ImGuiID dockspace_id)
     ImGui::DockBuilderAddNode(dockspace_id, ImGuiDockNodeFlags_DockSpace);
     ImGui::DockBuilderSetNodeSize(dockspace_id, ImGui::GetMainViewport()->Size);
 
+    ImGuiID sidebar, grid;
+    ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Left, 0.22f, &sidebar, &grid);
+
     ImGuiID top, bottom;
-    ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Up, 0.5f, &top, &bottom);
+    ImGui::DockBuilderSplitNode(grid, ImGuiDir_Up, 0.5f, &top, &bottom);
 
     ImGuiID top_left, top_right;
     ImGui::DockBuilderSplitNode(top, ImGuiDir_Left, 0.5f, &top_left, &top_right);
@@ -154,6 +157,7 @@ static void BuildDockLayout(ImGuiID dockspace_id)
     ImGuiID bottom_left, bottom_right;
     ImGui::DockBuilderSplitNode(bottom, ImGuiDir_Left, 0.5f, &bottom_left, &bottom_right);
 
+    ImGui::DockBuilderDockWindow("Controls", sidebar);
     ImGui::DockBuilderDockWindow("Axial", top_left);
     ImGui::DockBuilderDockWindow("Coronal", top_right);
     ImGui::DockBuilderDockWindow("Sagittal", bottom_left);
@@ -387,17 +391,44 @@ static void DrawCrosshairAndReadout(ImVec2 item_min, ImVec2 item_size, int tex_w
 // to render that frame's raycast (see raycaster.h's CameraFrame) so the
 // outline lines up with the volume exactly. Skips drawing if any corner
 // falls behind the camera (cheap near-plane clip, fine for a UI overlay).
-static void DrawSlicePlaneOutline(ImVec2 item_min, ImVec2 item_size, const CameraFrame& cam, const float corners_world[4][3], ImU32 color)
+// Shared by DrawSlicePlaneOutline (rendering) and PointOnSlicePlane (double-
+// click hit-testing) so both project the same 4 corners the same way.
+// Returns false (leaving out_screen untouched) if any corner is behind the camera.
+static bool ProjectPlaneCorners(ImVec2 item_min, ImVec2 item_size, const CameraFrame& cam, const float corners_world[4][3], ImVec2 out_screen[4])
 {
-    ImVec2 screen[4];
     for (int c = 0; c < 4; ++c)
     {
         float ndc[2];
         if (!ProjectToNDC(cam, corners_world[c], ndc))
-            return;
-        screen[c].x = item_min.x + (ndc[0] * 0.5f + 0.5f) * item_size.x;
-        screen[c].y = item_min.y + (1.0f - (ndc[1] * 0.5f + 0.5f)) * item_size.y;
+            return false;
+        out_screen[c].x = item_min.x + (ndc[0] * 0.5f + 0.5f) * item_size.x;
+        out_screen[c].y = item_min.y + (1.0f - (ndc[1] * 0.5f + 0.5f)) * item_size.y;
     }
+    return true;
+}
+
+// Even-odd point-in-polygon test (works for our convex screen quads either winding order).
+static bool PointInQuad(ImVec2 p, const ImVec2 quad[4])
+{
+    bool inside = false;
+    for (int i = 0, j = 3; i < 4; j = i++)
+    {
+        bool crosses = ((quad[i].y > p.y) != (quad[j].y > p.y));
+        if (crosses)
+        {
+            float x_at_p_y = quad[i].x + (p.y - quad[i].y) * (quad[j].x - quad[i].x) / (quad[j].y - quad[i].y);
+            if (p.x < x_at_p_y)
+                inside = !inside;
+        }
+    }
+    return inside;
+}
+
+static void DrawSlicePlaneOutline(ImVec2 item_min, ImVec2 item_size, const CameraFrame& cam, const float corners_world[4][3], ImU32 color)
+{
+    ImVec2 screen[4];
+    if (!ProjectPlaneCorners(item_min, item_size, cam, corners_world, screen))
+        return;
 
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
     draw_list->AddConvexPolyFilled(screen, 4, (color & 0x00FFFFFF) | 0x20000000);
@@ -450,6 +481,7 @@ int main(int argc, char** argv)
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
 
     bool dock_layout_built = false;
+    bool needs_initial_focus = false; // set the frame after the layout is built, since "Axial" isn't a known window name until it's Begin()'d once
     ImVec4 clear_color = ImVec4(0.10f, 0.10f, 0.12f, 1.00f);
 
     // Loads whichever case argv[1] selected (see source/export_gui_volume.py).
@@ -471,15 +503,44 @@ int main(int argc, char** argv)
     // Clicking in a panel updates the OTHER two (the in-plane coordinates),
     // which is what links the three views together.
     int cursor_i = 0, cursor_j = 0, cursor_k = 0;
-    float window_width = 400.0f, window_level = 40.0f; // soft tissue preset, shared across planes
     bool k_dirty = true, j_dirty = true, i_dirty = true;
 
-    // Ctrl+wheel zoom, per panel (1 = fit-to-panel, same as before this
-    // existed). >1 displays the slice larger than the panel inside a
-    // scrolling child region, so the sliders/headers above it never resize
-    // or get pushed around by the zoom level.
-    float axial_zoom = 1.0f, coronal_zoom = 1.0f, sagittal_zoom = 1.0f;
-    const float kMinZoom = 1.0f, kMaxZoom = 8.0f;
+    // Width/Level, per MPR panel (index via kAxial/kCoronal/kSagittal below).
+    // Default ("global") mode keeps all three in sync on every change, same
+    // as the single shared value this used to be; "G" flips to isolated mode
+    // where each panel's W/L is independent. Slice is NOT part of this
+    // toggle -- it's always per-panel, since the three planes' slice indices
+    // are physically different quantities regardless of this setting.
+    enum { kAxial = 0, kCoronal = 1, kSagittal = 2 };
+    float window_width[3] = { 400.0f, 400.0f, 400.0f };
+    float window_level[3] = { 40.0f, 40.0f, 40.0f };
+    bool global_wl_mode = true; // "G" toggles
+    bool* const wl_dirty[3] = { &k_dirty, &j_dirty, &i_dirty }; // panel index -> its own texture's dirty flag
+
+    // Sets panel `p`'s W/L; in global mode, propagates to all three panels
+    // (and dirties all three) rather than just `p`.
+    auto SetWindowLevel = [&](int p, float ww, float wl)
+    {
+        if (global_wl_mode)
+        {
+            for (int i = 0; i < 3; ++i) { window_width[i] = ww; window_level[i] = wl; *wl_dirty[i] = true; }
+        }
+        else
+        {
+            window_width[p] = ww; window_level[p] = wl; *wl_dirty[p] = true;
+        }
+    };
+
+    // Panel focus (click anywhere in a panel, or Q/E to cycle) + which
+    // parameter Shift+S/W/L selected as the target of A/D and the mouse
+    // wheel (when not Ctrl-zooming). The focused panel's active parameter is
+    // highlighted in the sidebar so it's clear what's about to change.
+    enum class PanelId { Axial, Coronal, Sagittal, ThreeD };
+    enum class ParamFocus { Slice, Width, Level };
+    PanelId focused_panel = PanelId::Axial;
+    ParamFocus active_param = ParamFocus::Slice;
+    float param_step = 50.0f; // Shift+A/Shift+D step for the active parameter; user-adjustable in the sidebar
+    const char* kPanelWindowNames[3] = { "Axial", "Coronal", "Sagittal" }; // Q/E cycle these; 3D keeps its own controls
 
     // OAR mask/contour overlay (source/export_gui_volume.py --export-masks).
     // Optional: the MPR panels just show plain CT if this fails to load.
@@ -519,6 +580,7 @@ int main(int argc, char** argv)
     // the DVH plot still has something to show end-to-end.
     std::vector<DVHCurve> dvh_curves;
     bool show_dvh = false;
+    bool dvh_needs_repositioning = true; // forces a sane pos/size the first time (and after toggled back on)
     bool dvh_dose_is_synthetic = true;
 
     if (ct_loaded)
@@ -646,6 +708,12 @@ int main(int argc, char** argv)
         {
             BuildDockLayout(dockspace_id);
             dock_layout_built = true;
+            needs_initial_focus = true;
+        }
+        else if (needs_initial_focus)
+        {
+            ImGui::SetWindowFocus("Axial"); // otherwise the last-Begin()'d panel (3D) gets implicit initial focus
+            needs_initial_focus = false;
         }
 
         // If a "Run Inference" job finished this frame, reload its output.
@@ -693,13 +761,80 @@ int main(int argc, char** argv)
                     overlay_toggled_from_menu = true;
                 if (ImGui::MenuItem("Prediction overlay", nullptr, &show_prediction_overlay, prediction_loaded))
                     overlay_toggled_from_menu = true;
-                ImGui::MenuItem("DVH", nullptr, &show_dvh, masks_loaded);
+                if (ImGui::MenuItem("DVH", nullptr, &show_dvh, masks_loaded) && show_dvh)
+                    dvh_needs_repositioning = true; // snap it back into the main window, wherever it drifted to before
+                ImGui::Separator();
+                if (ImGui::MenuItem("Reset Layout"))
+                    dock_layout_built = false; // rebuilds Controls/Axial/Coronal/Sagittal/3D at their default proportions next frame
                 ImGui::EndMenu();
             }
             ImGui::EndMainMenuBar();
         }
         if (overlay_toggled_from_menu)
             k_dirty = j_dirty = i_dirty = true;
+
+        // Global keyboard shortcuts: Q/E cycle which MPR panel is focused;
+        // Shift+S/W/L pick which parameter A/D and the mouse wheel adjust;
+        // G toggles Width/Level between synced-across-all-three and
+        // per-panel-isolated. GetKeyState for Ctrl/Shift (not io.KeyCtrl/
+        // KeyShift) for the same reason as the zoom fix: those only refresh
+        // on a fresh WM_KEYDOWN/UP reaching this window, not the live state.
+        if (ct_loaded)
+        {
+            if (ImGui::IsKeyPressed(ImGuiKey_Q, false))
+            {
+                int cur = (focused_panel == PanelId::ThreeD) ? 0 : (int)focused_panel;
+                focused_panel = (PanelId)((cur + 2) % 3);
+                ImGui::SetWindowFocus(kPanelWindowNames[(int)focused_panel]);
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_E, false))
+            {
+                int cur = (focused_panel == PanelId::ThreeD) ? 0 : (int)focused_panel;
+                focused_panel = (PanelId)((cur + 1) % 3);
+                ImGui::SetWindowFocus(kPanelWindowNames[(int)focused_panel]);
+            }
+
+            bool shift_held = (::GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            if (shift_held && ImGui::IsKeyPressed(ImGuiKey_S, false)) active_param = ParamFocus::Slice;
+            if (shift_held && ImGui::IsKeyPressed(ImGuiKey_W, false)) active_param = ParamFocus::Width;
+            if (shift_held && ImGui::IsKeyPressed(ImGuiKey_L, false)) active_param = ParamFocus::Level;
+
+            if (ImGui::IsKeyPressed(ImGuiKey_G, false))
+            {
+                global_wl_mode = !global_wl_mode;
+                if (global_wl_mode)
+                {
+                    int p = (focused_panel == PanelId::ThreeD) ? (int)kAxial : (int)focused_panel;
+                    SetWindowLevel(p, window_width[p], window_level[p]); // propagate focused panel's W/L to all three
+                }
+            }
+
+            // Shift+A/Shift+D adjust whichever parameter is active, by
+            // param_step, for the focused panel. Wheel-based adjustment was
+            // dropped (hover/focus detection over it proved unreliable);
+            // this is the sole adjustment control now besides the sidebar sliders.
+            if (focused_panel != PanelId::ThreeD)
+            {
+                int p = (int)focused_panel;
+                float delta = 0.0f;
+                if (shift_held && ImGui::IsKeyPressed(ImGuiKey_A)) delta = -param_step;
+                if (shift_held && ImGui::IsKeyPressed(ImGuiKey_D)) delta = param_step;
+                if (delta != 0.0f)
+                {
+                    if (active_param == ParamFocus::Slice)
+                    {
+                        int* cursor_ptr = (p == kAxial) ? &cursor_k : (p == kCoronal) ? &cursor_j : &cursor_i;
+                        int max_val = (p == kAxial) ? ct_volume.nz - 1 : (p == kCoronal) ? ct_volume.ny - 1 : ct_volume.nx - 1;
+                        *cursor_ptr = std::clamp(*cursor_ptr + (int)delta, 0, max_val);
+                        *wl_dirty[p] = true;
+                    }
+                    else if (active_param == ParamFocus::Width)
+                        SetWindowLevel(p, std::clamp(window_width[p] + delta, 1.0f, 4000.0f), window_level[p]);
+                    else
+                        SetWindowLevel(p, window_width[p], std::clamp(window_level[p] + delta, -1000.0f, 1000.0f));
+                }
+            }
+        }
 
         StructureComparisonContext cmp;
         cmp.masks_loaded = masks_loaded;
@@ -708,37 +843,70 @@ int main(int argc, char** argv)
         cmp.prediction_volume = &prediction_volume;
         cmp.structure_dice = &structure_dice;
 
-        ImGui::Begin("Axial");
+        ImGui::Begin("Controls");
         if (ct_loaded)
         {
-            k_dirty |= ImGui::SliderInt("Slice", &cursor_k, 0, ct_volume.nz - 1);
+            static const char* kPanelLabel[4] = { "Axial", "Coronal", "Sagittal", "3D" };
+            ImGui::Text("Focused panel: %s  (Q/E to cycle)", kPanelLabel[(int)focused_panel]);
+            ImGui::Text("W/L mode: %s  (G to toggle)", global_wl_mode ? "Global (shared)" : "Isolated (per-panel)");
+            ImGui::Separator();
 
-            bool wl_changed = false;
-            wl_changed |= ImGui::SliderFloat("Width", &window_width, 1.0f, 4000.0f, "%.0f");
-            wl_changed |= ImGui::SliderFloat("Level", &window_level, -1000.0f, 1000.0f, "%.0f");
+            int active_p = (focused_panel == PanelId::ThreeD) ? (int)PanelId::Axial : (int)focused_panel;
+            auto PushHighlight = [&](bool on) { if (on) ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.35f, 0.55f, 0.30f, 1.0f)); };
+            auto PopHighlight = [&](bool on) { if (on) ImGui::PopStyleColor(); };
 
-            if (ImGui::Button("Soft 400/40")) { window_width = 400; window_level = 40; wl_changed = true; }
-            ImGui::SameLine();
-            if (ImGui::Button("Lung 1500/-600")) { window_width = 1500; window_level = -600; wl_changed = true; }
-            ImGui::SameLine();
-            if (ImGui::Button("Bone 2000/500")) { window_width = 2000; window_level = 500; wl_changed = true; }
-            ImGui::SameLine();
-            if (ImGui::Button("Brain 80/40")) { window_width = 80; window_level = 40; wl_changed = true; }
-
-            if (ImGui::IsWindowHovered() && io.MouseWheel != 0.0f)
+            if (focused_panel != PanelId::ThreeD)
             {
-                if ((::GetKeyState(VK_CONTROL) & 0x8000) != 0)
-                    axial_zoom = std::clamp(axial_zoom * powf(1.1f, io.MouseWheel), kMinZoom, kMaxZoom);
-                else
-                {
-                    cursor_k = std::clamp(cursor_k - (int)io.MouseWheel, 0, ct_volume.nz - 1);
-                    k_dirty = true;
-                }
+                int* cursor_ptr = (active_p == kAxial) ? &cursor_k : (active_p == kCoronal) ? &cursor_j : &cursor_i;
+                int max_val = (active_p == kAxial) ? ct_volume.nz - 1 : (active_p == kCoronal) ? ct_volume.ny - 1 : ct_volume.nx - 1;
+                bool on = active_param == ParamFocus::Slice;
+                PushHighlight(on);
+                ImGui::SetNextItemWidth(120.0f);
+                if (ImGui::SliderInt("Slice", cursor_ptr, 0, max_val))
+                    *wl_dirty[active_p] = true;
+                PopHighlight(on);
+            }
+            else
+            {
+                ImGui::TextDisabled("Slice - N/A for 3D (drag to orbit)");
             }
 
-            // W/L is shared across all views, so a change here dirties all of them.
-            if (wl_changed)
-                k_dirty = j_dirty = i_dirty = true;
+            {
+                bool on = active_param == ParamFocus::Width;
+                PushHighlight(on);
+                ImGui::SetNextItemWidth(120.0f);
+                float ww = window_width[active_p];
+                if (ImGui::SliderFloat("Width", &ww, 1.0f, 4000.0f, "%.0f"))
+                    SetWindowLevel(active_p, ww, window_level[active_p]);
+                PopHighlight(on);
+            }
+            {
+                bool on = active_param == ParamFocus::Level;
+                PushHighlight(on);
+                ImGui::SetNextItemWidth(120.0f);
+                float wl = window_level[active_p];
+                if (ImGui::SliderFloat("Level", &wl, -1000.0f, 1000.0f, "%.0f"))
+                    SetWindowLevel(active_p, window_width[active_p], wl);
+                PopHighlight(on);
+            }
+
+            if (ImGui::Button("Soft 400/40")) SetWindowLevel(active_p, 400, 40);
+            ImGui::SameLine();
+            if (ImGui::Button("Lung 1500/-600")) SetWindowLevel(active_p, 1500, -600);
+            if (ImGui::Button("Bone 2000/500")) SetWindowLevel(active_p, 2000, 500);
+            ImGui::SameLine();
+            if (ImGui::Button("Brain 80/40")) SetWindowLevel(active_p, 80, 40);
+
+            ImGui::SetNextItemWidth(120.0f);
+            ImGui::SliderFloat("Shift+A/D step", &param_step, 1.0f, 200.0f, "%.0f");
+
+            ImGui::Separator();
+            ImGui::TextWrapped(
+                "Click a panel (or Q/E) to focus it. Shift+S/W/L picks Slice/"
+                "Width/Level (highlighted above); Shift+A/Shift+D adjusts it "
+                "by the step above. G toggles Width/Level between "
+                "shared-across-all-three and per-panel.");
+            ImGui::Separator();
 
             if (masks_loaded && ImGui::CollapsingHeader("Structures (ground truth)"))
             {
@@ -770,7 +938,6 @@ int main(int argc, char** argv)
                 ImGui::EndDisabled();
                 if (inference_job.running)
                 {
-                    ImGui::SameLine();
                     ImGui::Text("Running... (%.0fs) - nnU-Net 4-fold ensemble, see console for progress", (GetTickCount() - inference_job.start_tick_ms) / 1000.0f);
                 }
                 else if (!prediction_loaded)
@@ -800,7 +967,17 @@ int main(int argc, char** argv)
                         k_dirty = j_dirty = i_dirty = true;
                 }
             }
+        }
+        else
+        {
+            ImGui::TextUnformatted("No CT loaded, see console");
+        }
+        ImGui::End();
 
+        ImGui::Begin("Axial");
+        if (ImGui::IsWindowFocused()) focused_panel = PanelId::Axial;
+        if (ct_loaded)
+        {
             if (k_dirty)
             {
                 std::vector<OverlayLayer> layers = {
@@ -809,16 +986,12 @@ int main(int argc, char** argv)
                     { [&](int i, int j) { return prediction_loaded ? prediction_volume.At(i, j, cursor_k) : (uint8_t)0; },
                       show_prediction_overlay, prediction_overlay_alpha, &prediction_label_visible, &prediction_label_colors },
                 };
-                UploadSlice(axial_tex, ct_volume.nx, ct_volume.ny, window_width, window_level,
+                UploadSlice(axial_tex, ct_volume.nx, ct_volume.ny, window_width[kAxial], window_level[kAxial],
                     [&](int i, int j) { return ct_volume.At(i, j, cursor_k); }, layers);
                 k_dirty = false;
             }
 
-            ImVec2 avail = ImGui::GetContentRegionAvail();
-            ImVec2 fit_size = FitImageSize(avail, ct_volume.nx, ct_volume.ny, ct_volume.spacing[0], ct_volume.spacing[1]);
-            ImVec2 size(fit_size.x * axial_zoom, fit_size.y * axial_zoom);
-
-            ImGui::BeginChild("AxialImageRegion", avail, false, ImGuiWindowFlags_HorizontalScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+            ImVec2 size = FitImageSize(ImGui::GetContentRegionAvail(), ct_volume.nx, ct_volume.ny, ct_volume.spacing[0], ct_volume.spacing[1]);
             ImGui::Image((ImTextureID)(intptr_t)axial_srv, size);
 
             ImVec2 item_min = ImGui::GetItemRectMin();
@@ -830,7 +1003,6 @@ int main(int argc, char** argv)
             }
             DrawCrosshairAndReadout(item_min, size, ct_volume.nx, ct_volume.ny, cursor_i, cursor_j, false,
                 ct_volume, cursor_i, cursor_j, cursor_k, cmp);
-            ImGui::EndChild();
         }
         else
         {
@@ -839,21 +1011,9 @@ int main(int argc, char** argv)
         ImGui::End();
 
         ImGui::Begin("Coronal");
+        if (ImGui::IsWindowFocused()) focused_panel = PanelId::Coronal;
         if (ct_loaded)
         {
-            j_dirty |= ImGui::SliderInt("Slice", &cursor_j, 0, ct_volume.ny - 1);
-
-            if (ImGui::IsWindowHovered() && io.MouseWheel != 0.0f)
-            {
-                if ((::GetKeyState(VK_CONTROL) & 0x8000) != 0)
-                    coronal_zoom = std::clamp(coronal_zoom * powf(1.1f, io.MouseWheel), kMinZoom, kMaxZoom);
-                else
-                {
-                    cursor_j = std::clamp(cursor_j - (int)io.MouseWheel, 0, ct_volume.ny - 1);
-                    j_dirty = true;
-                }
-            }
-
             if (j_dirty)
             {
                 // width=x, height=z; row 0 = k=0 (inferior) -- flip via UV below so superior is on top.
@@ -863,16 +1023,12 @@ int main(int argc, char** argv)
                     { [&](int i, int k) { return prediction_loaded ? prediction_volume.At(i, cursor_j, k) : (uint8_t)0; },
                       show_prediction_overlay, prediction_overlay_alpha, &prediction_label_visible, &prediction_label_colors },
                 };
-                UploadSlice(coronal_tex, ct_volume.nx, ct_volume.nz, window_width, window_level,
+                UploadSlice(coronal_tex, ct_volume.nx, ct_volume.nz, window_width[kCoronal], window_level[kCoronal],
                     [&](int i, int k) { return ct_volume.At(i, cursor_j, k); }, layers);
                 j_dirty = false;
             }
 
-            ImVec2 avail = ImGui::GetContentRegionAvail();
-            ImVec2 fit_size = FitImageSize(avail, ct_volume.nx, ct_volume.nz, ct_volume.spacing[0], ct_volume.spacing[2]);
-            ImVec2 size(fit_size.x * coronal_zoom, fit_size.y * coronal_zoom);
-
-            ImGui::BeginChild("CoronalImageRegion", avail, false, ImGuiWindowFlags_HorizontalScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+            ImVec2 size = FitImageSize(ImGui::GetContentRegionAvail(), ct_volume.nx, ct_volume.nz, ct_volume.spacing[0], ct_volume.spacing[2]);
             ImGui::Image((ImTextureID)(intptr_t)coronal_srv, size, ImVec2(0, 1), ImVec2(1, 0));
 
             ImVec2 item_min = ImGui::GetItemRectMin();
@@ -884,7 +1040,6 @@ int main(int argc, char** argv)
             }
             DrawCrosshairAndReadout(item_min, size, ct_volume.nx, ct_volume.nz, cursor_i, cursor_k, true,
                 ct_volume, cursor_i, cursor_j, cursor_k, cmp);
-            ImGui::EndChild();
         }
         else
         {
@@ -893,21 +1048,9 @@ int main(int argc, char** argv)
         ImGui::End();
 
         ImGui::Begin("Sagittal");
+        if (ImGui::IsWindowFocused()) focused_panel = PanelId::Sagittal;
         if (ct_loaded)
         {
-            i_dirty |= ImGui::SliderInt("Slice", &cursor_i, 0, ct_volume.nx - 1);
-
-            if (ImGui::IsWindowHovered() && io.MouseWheel != 0.0f)
-            {
-                if ((::GetKeyState(VK_CONTROL) & 0x8000) != 0)
-                    sagittal_zoom = std::clamp(sagittal_zoom * powf(1.1f, io.MouseWheel), kMinZoom, kMaxZoom);
-                else
-                {
-                    cursor_i = std::clamp(cursor_i - (int)io.MouseWheel, 0, ct_volume.nx - 1);
-                    i_dirty = true;
-                }
-            }
-
             if (i_dirty)
             {
                 // width=y, height=z; same vertical flip as coronal (superior on top).
@@ -917,16 +1060,12 @@ int main(int argc, char** argv)
                     { [&](int j, int k) { return prediction_loaded ? prediction_volume.At(cursor_i, j, k) : (uint8_t)0; },
                       show_prediction_overlay, prediction_overlay_alpha, &prediction_label_visible, &prediction_label_colors },
                 };
-                UploadSlice(sagittal_tex, ct_volume.ny, ct_volume.nz, window_width, window_level,
+                UploadSlice(sagittal_tex, ct_volume.ny, ct_volume.nz, window_width[kSagittal], window_level[kSagittal],
                     [&](int j, int k) { return ct_volume.At(cursor_i, j, k); }, layers);
                 i_dirty = false;
             }
 
-            ImVec2 avail = ImGui::GetContentRegionAvail();
-            ImVec2 fit_size = FitImageSize(avail, ct_volume.ny, ct_volume.nz, ct_volume.spacing[1], ct_volume.spacing[2]);
-            ImVec2 size(fit_size.x * sagittal_zoom, fit_size.y * sagittal_zoom);
-
-            ImGui::BeginChild("SagittalImageRegion", avail, false, ImGuiWindowFlags_HorizontalScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+            ImVec2 size = FitImageSize(ImGui::GetContentRegionAvail(), ct_volume.ny, ct_volume.nz, ct_volume.spacing[1], ct_volume.spacing[2]);
             ImGui::Image((ImTextureID)(intptr_t)sagittal_srv, size, ImVec2(0, 1), ImVec2(1, 0));
 
             ImVec2 item_min = ImGui::GetItemRectMin();
@@ -938,7 +1077,6 @@ int main(int argc, char** argv)
             }
             DrawCrosshairAndReadout(item_min, size, ct_volume.ny, ct_volume.nz, cursor_j, cursor_k, true,
                 ct_volume, cursor_i, cursor_j, cursor_k, cmp);
-            ImGui::EndChild();
         }
         else
         {
@@ -947,12 +1085,31 @@ int main(int argc, char** argv)
         ImGui::End();
 
         ImGui::Begin("3D");
+        if (ImGui::IsWindowFocused()) focused_panel = PanelId::ThreeD;
         if (ct_loaded && raycaster_ok)
         {
+            // Space: full reset (also the way out of axis-lock mode).
+            if (ImGui::IsWindowHovered() && ImGui::IsKeyPressed(ImGuiKey_Space, false))
+            {
+                raycaster.locked_axis = -1;
+                raycaster.azimuth = 0.7f;
+                raycaster.elevation = 0.35f;
+                raycaster.distance = raycaster.default_distance;
+                raycaster.target_offset[0] = raycaster.target_offset[1] = raycaster.target_offset[2] = 0.0f;
+            }
+
             if (ImGui::IsWindowHovered() && ImGui::IsMouseDragging(ImGuiMouseButton_Left))
             {
-                raycaster.azimuth += io.MouseDelta.x * 0.01f;
-                raycaster.elevation = std::clamp(raycaster.elevation - io.MouseDelta.y * 0.01f, -1.5f, 1.5f);
+                if (raycaster.locked_axis < 0)
+                {
+                    raycaster.azimuth += io.MouseDelta.x * 0.01f;
+                    raycaster.elevation = std::clamp(raycaster.elevation - io.MouseDelta.y * 0.01f, -1.5f, 1.5f);
+                }
+                else
+                {
+                    // One rotational DOF while locked: spin around the locked axis only.
+                    raycaster.locked_angle += io.MouseDelta.x * 0.01f;
+                }
             }
             if (ImGui::IsWindowHovered() && ImGui::IsMouseDragging(ImGuiMouseButton_Right))
             {
@@ -975,11 +1132,37 @@ int main(int argc, char** argv)
             raycast_overlay.pred_enabled = show_prediction_overlay;
             raycast_overlay.pred_alpha = prediction_overlay_alpha;
             raycast_overlay.pred_visible_mask = PackVisibleMask(prediction_label_visible);
-            RenderRaycast(g_pd3dDeviceContext, raycaster, ct_volume, window_width, window_level, raycast_overlay);
+            RenderRaycast(g_pd3dDeviceContext, raycaster, ct_volume, window_width[kAxial], window_level[kAxial], raycast_overlay);
+
+            // Standard anatomical viewpoints (3D Slicer convention): also clears any axis lock.
+            auto StandardView = [&](float az, float elev)
+            {
+                raycaster.locked_axis = -1;
+                raycaster.azimuth = az;
+                raycaster.elevation = elev;
+                raycaster.target_offset[0] = raycaster.target_offset[1] = raycaster.target_offset[2] = 0.0f;
+            };
+            const float kHalfPi = 1.57079632679f;
+            if (ImGui::Button("A")) StandardView(-kHalfPi, 0.0f);
+            ImGui::SameLine();
+            if (ImGui::Button("P")) StandardView(kHalfPi, 0.0f);
+            ImGui::SameLine();
+            if (ImGui::Button("L")) StandardView(0.0f, 0.0f);
+            ImGui::SameLine();
+            if (ImGui::Button("R")) StandardView(3.14159265f, 0.0f);
+            ImGui::SameLine();
+            if (ImGui::Button("S")) StandardView(0.0f, kHalfPi);
+            ImGui::SameLine();
+            if (ImGui::Button("I")) StandardView(0.0f, -kHalfPi);
+            ImGui::SameLine();
+            ImGui::TextDisabled("(view)");
 
             ImGui::Checkbox("Show slice planes", &show_slice_planes);
             ImGui::SameLine();
-            ImGui::TextUnformatted("(drag to orbit, right-drag to pan, wheel to zoom)");
+            if (raycaster.locked_axis < 0)
+                ImGui::TextUnformatted("(drag to orbit, right-drag to pan, wheel to zoom, dbl-click a plane to lock to it)");
+            else
+                ImGui::TextUnformatted("(locked to one axis - drag to spin, Space to reset)");
             ImVec2 avail = ImGui::GetContentRegionAvail();
             ImVec2 size = FitImageSize(avail, raycaster.target_size, raycaster.target_size, 1.0, 1.0);
             ImGui::Image((ImTextureID)(intptr_t)raycaster.target_srv, size);
@@ -997,14 +1180,34 @@ int main(int argc, char** argv)
                 float zk = (float)(ct_volume.origin[2] + (cursor_k + 0.5) * ct_volume.spacing[2]);
 
                 // Slicer's color convention: axial=red, coronal=yellow, sagittal=green.
+                // locked_axis convention (see raycaster.h): 0=X(sagittal normal), 1=Y(coronal normal), 2=Z(axial normal).
                 float axial_corners[4][3] = { { xmin, ymin, zk }, { xmax, ymin, zk }, { xmax, ymax, zk }, { xmin, ymax, zk } };
-                DrawSlicePlaneOutline(item_min, size, cam, axial_corners, IM_COL32(230, 60, 60, 255));
-
                 float coronal_corners[4][3] = { { xmin, yk, zmin }, { xmax, yk, zmin }, { xmax, yk, zmax }, { xmin, yk, zmax } };
-                DrawSlicePlaneOutline(item_min, size, cam, coronal_corners, IM_COL32(230, 210, 60, 255));
-
                 float sagittal_corners[4][3] = { { xk, ymin, zmin }, { xk, ymax, zmin }, { xk, ymax, zmax }, { xk, ymin, zmax } };
-                DrawSlicePlaneOutline(item_min, size, cam, sagittal_corners, IM_COL32(60, 220, 120, 255));
+
+                bool double_clicked = ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
+                bool was_free = raycaster.locked_axis < 0; // only ENTER a lock from free mode via double-click, never re-target an existing one
+                ImVec2 mouse = io.MousePos;
+                ImVec2 screen_quad[4];
+
+                if (raycaster.locked_axis < 0 || raycaster.locked_axis == 2)
+                {
+                    DrawSlicePlaneOutline(item_min, size, cam, axial_corners, IM_COL32(230, 60, 60, 255));
+                    if (double_clicked && was_free && ProjectPlaneCorners(item_min, size, cam, axial_corners, screen_quad) && PointInQuad(mouse, screen_quad))
+                        { raycaster.locked_axis = 2; raycaster.locked_angle = 0.0f; }
+                }
+                if (raycaster.locked_axis < 0 || raycaster.locked_axis == 1)
+                {
+                    DrawSlicePlaneOutline(item_min, size, cam, coronal_corners, IM_COL32(230, 210, 60, 255));
+                    if (double_clicked && was_free && ProjectPlaneCorners(item_min, size, cam, coronal_corners, screen_quad) && PointInQuad(mouse, screen_quad))
+                        { raycaster.locked_axis = 1; raycaster.locked_angle = 0.0f; }
+                }
+                if (raycaster.locked_axis < 0 || raycaster.locked_axis == 0)
+                {
+                    DrawSlicePlaneOutline(item_min, size, cam, sagittal_corners, IM_COL32(60, 220, 120, 255));
+                    if (double_clicked && was_free && ProjectPlaneCorners(item_min, size, cam, sagittal_corners, screen_quad) && PointInQuad(mouse, screen_quad))
+                        { raycaster.locked_axis = 0; raycaster.locked_angle = 0.0f; }
+                }
             }
         }
         else
@@ -1015,6 +1218,14 @@ int main(int argc, char** argv)
 
         if (show_dvh)
         {
+            if (dvh_needs_repositioning)
+            {
+                ImVec2 vp_size = ImGui::GetMainViewport()->Size;
+                ImVec2 vp_pos = ImGui::GetMainViewport()->Pos;
+                ImGui::SetNextWindowPos(ImVec2(vp_pos.x + vp_size.x * 0.5f, vp_pos.y + vp_size.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+                ImGui::SetNextWindowSize(ImVec2(std::min(600.0f, vp_size.x * 0.6f), std::min(450.0f, vp_size.y * 0.6f)), ImGuiCond_Always);
+                dvh_needs_repositioning = false;
+            }
             ImGui::Begin("DVH", &show_dvh);
             if (!dvh_curves.empty())
             {

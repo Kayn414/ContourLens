@@ -10,7 +10,7 @@
 
 struct Volume
 {
-    std::vector<int16_t> data; // C-order, index (k, j, i) == (z, y, x) # RAS -> Superior, Anterior, Right 
+    std::vector<int16_t> data; // C-order, index (k, j, i) == (z, y, x) 
     int nx = 0, ny = 0, nz = 0;
     double spacing[3] = { 1.0, 1.0, 1.0 };   // (sx, sy, sz) mm
     double origin[3] = { 0.0, 0.0, 0.0 };    // (ox, oy, oz) mm, LPS
