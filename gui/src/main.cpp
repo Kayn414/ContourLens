@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
+#include <vector>
 #include <d3d11.h>
 #include <tchar.h>
 
@@ -122,6 +124,69 @@ static ImVec2 FitImageSize(ImVec2 avail, int tex_w, int tex_h, double sp_w, doub
     return ImVec2(phys_w * scale, phys_h * scale);
 }
 
+// Maximum-intensity projection along y (front-to-back): a cheap DRR-like
+// frontal placeholder for the "3D" panel until a real GPU raycast exists.
+// Output is (nx, nz), same shape/orientation as the coronal texture.
+static std::vector<int16_t> ComputeFrontalMIP(const Volume& vol)
+{
+    std::vector<int16_t> mip((size_t)vol.nx * vol.nz, std::numeric_limits<int16_t>::min());
+    for (int k = 0; k < vol.nz; ++k)
+        for (int j = 0; j < vol.ny; ++j)
+            for (int i = 0; i < vol.nx; ++i)
+            {
+                int16_t& m = mip[(size_t)k * vol.nx + i];
+                int16_t v = vol.At(i, j, k);
+                if (v > m) m = v;
+            }
+    return mip;
+}
+
+// If the item just drawn (expected to be an ImGui::Image of a (tex_w x
+// tex_h) slice texture, optionally vertically flipped per `flipped`) is
+// being clicked/dragged, converts the mouse position to texture pixel
+// coordinates. Returns false (leaving *out_col/*out_row untouched) otherwise.
+static bool PanelClicked(ImVec2 item_min, ImVec2 item_size, int tex_w, int tex_h, bool flipped, int* out_col, int* out_row)
+{
+    if (!ImGui::IsItemHovered() || !ImGui::IsMouseDown(ImGuiMouseButton_Left))
+        return false;
+
+    ImVec2 mouse = ImGui::GetIO().MousePos;
+    float fx = (mouse.x - item_min.x) / item_size.x;
+    float fy = (mouse.y - item_min.y) / item_size.y;
+    if (fx < 0.0f || fx > 1.0f || fy < 0.0f || fy > 1.0f)
+        return false;
+
+    int col = std::clamp((int)(fx * tex_w), 0, tex_w - 1);
+    int display_row = std::clamp((int)(fy * tex_h), 0, tex_h - 1);
+    *out_col = col;
+    *out_row = flipped ? (tex_h - 1 - display_row) : display_row;
+    return true;
+}
+
+// Crosshair through the shared cursor voxel (ci, cj, ck), projected into
+// this panel's (col, row) in-plane coordinates, plus an (i,j,k)/HU readout.
+static void DrawCrosshairAndReadout(ImVec2 item_min, ImVec2 item_size, int tex_w, int tex_h, int col, int row, bool flipped,
+    const Volume& vol, int ci, int cj, int ck)
+{
+    int display_row = flipped ? (tex_h - 1 - row) : row;
+    float sx = item_min.x + ((float)col + 0.5f) / tex_w * item_size.x;
+    float sy = item_min.y + ((float)display_row + 0.5f) / tex_h * item_size.y;
+
+    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+    const ImU32 color = IM_COL32(255, 230, 0, 180);
+    draw_list->AddLine(ImVec2(sx, item_min.y), ImVec2(sx, item_min.y + item_size.y), color);
+    draw_list->AddLine(ImVec2(item_min.x, sy), ImVec2(item_min.x + item_size.x, sy), color);
+
+    // Drawn as an overlay on the image (not a separate ImGui::Text line) so it
+    // can't push the panel's content past the dock quadrant's fixed height.
+    char buf[64];
+    snprintf(buf, sizeof(buf), "(i=%d, j=%d, k=%d)  HU=%d", ci, cj, ck, vol.At(ci, cj, ck));
+    ImVec2 text_pos(item_min.x + 4.0f, item_min.y + 4.0f);
+    ImVec2 text_size = ImGui::CalcTextSize(buf);
+    draw_list->AddRectFilled(text_pos, ImVec2(text_pos.x + text_size.x + 4.0f, text_pos.y + text_size.y + 4.0f), IM_COL32(0, 0, 0, 160));
+    draw_list->AddText(ImVec2(text_pos.x + 2.0f, text_pos.y + 2.0f), IM_COL32(255, 255, 255, 255), buf);
+}
+
 int main(int, char**)
 {
     WNDCLASSEXW wc = {
@@ -172,26 +237,33 @@ int main(int, char**)
     ID3D11ShaderResourceView* coronal_srv = nullptr;
     ID3D11Texture2D* sagittal_tex = nullptr;
     ID3D11ShaderResourceView* sagittal_srv = nullptr;
+    ID3D11Texture2D* mip_tex = nullptr;
+    ID3D11ShaderResourceView* mip_srv = nullptr;
+    std::vector<int16_t> frontal_mip;
 
-    int axial_slice = 0;    // k (z index)
-    int coronal_slice = 0;  // j (y index)
-    int sagittal_slice = 0; // i (x index)
+    // One shared world-space cursor, in voxel indices: cursor_k drives the
+    // axial slice, cursor_j the coronal slice, cursor_i the sagittal slice.
+    // Clicking in a panel updates the OTHER two (the in-plane coordinates),
+    // which is what links the three views together.
+    int cursor_i = 0, cursor_j = 0, cursor_k = 0;
     float window_width = 400.0f, window_level = 40.0f; // soft tissue preset, shared across planes
-    bool axial_dirty = true, coronal_dirty = true, sagittal_dirty = true;
+    bool k_dirty = true, j_dirty = true, i_dirty = true, mip_dirty = true;
 
     if (ct_loaded)
     {
-        axial_slice = ct_volume.nz / 2;
-        coronal_slice = ct_volume.ny / 2;
-        sagittal_slice = ct_volume.nx / 2;
+        cursor_i = ct_volume.nx / 2;
+        cursor_j = ct_volume.ny / 2;
+        cursor_k = ct_volume.nz / 2;
         auto [min_it, max_it] = std::minmax_element(ct_volume.data.begin(), ct_volume.data.end());
         printf("Loaded CT volume: %dx%dx%d spacing=(%.3f,%.3f,%.3f) HU range=[%d,%d]\n",
             ct_volume.nx, ct_volume.ny, ct_volume.nz,
             ct_volume.spacing[0], ct_volume.spacing[1], ct_volume.spacing[2],
             (int)*min_it, (int)*max_it);
+        frontal_mip = ComputeFrontalMIP(ct_volume);
         if (!CreateSliceTexture(ct_volume.nx, ct_volume.ny, &axial_tex, &axial_srv) ||
             !CreateSliceTexture(ct_volume.nx, ct_volume.nz, &coronal_tex, &coronal_srv) ||
-            !CreateSliceTexture(ct_volume.ny, ct_volume.nz, &sagittal_tex, &sagittal_srv))
+            !CreateSliceTexture(ct_volume.ny, ct_volume.nz, &sagittal_tex, &sagittal_srv) ||
+            !CreateSliceTexture(ct_volume.nx, ct_volume.nz, &mip_tex, &mip_srv))
         {
             fprintf(stderr, "Failed to create slice textures\n");
             ct_loaded = false;
@@ -256,8 +328,7 @@ int main(int, char**)
         ImGui::Begin("Axial");
         if (ct_loaded)
         {
-            bool slice_changed = axial_dirty;
-            slice_changed |= ImGui::SliderInt("Slice", &axial_slice, 0, ct_volume.nz - 1);
+            k_dirty |= ImGui::SliderInt("Slice", &cursor_k, 0, ct_volume.nz - 1);
 
             bool wl_changed = false;
             wl_changed |= ImGui::SliderFloat("Width", &window_width, 1.0f, 4000.0f, "%.0f");
@@ -273,24 +344,34 @@ int main(int, char**)
 
             if (ImGui::IsWindowHovered() && io.MouseWheel != 0.0f)
             {
-                axial_slice = std::clamp(axial_slice - (int)io.MouseWheel, 0, ct_volume.nz - 1);
-                slice_changed = true;
+                cursor_k = std::clamp(cursor_k - (int)io.MouseWheel, 0, ct_volume.nz - 1);
+                k_dirty = true;
             }
 
-            // W/L is shared across all three planes, so a change here dirties them too.
+            // W/L is shared across all four views, so a change here dirties all of them.
             if (wl_changed)
-                coronal_dirty = sagittal_dirty = true;
+                k_dirty = j_dirty = i_dirty = mip_dirty = true;
 
-            if (slice_changed || wl_changed)
+            if (k_dirty)
             {
                 UploadSlice(axial_tex, ct_volume.nx, ct_volume.ny, window_width, window_level,
-                    [&](int i, int j) { return ct_volume.At(i, j, axial_slice); });
-                axial_dirty = false;
+                    [&](int i, int j) { return ct_volume.At(i, j, cursor_k); });
+                k_dirty = false;
             }
 
             ImVec2 avail = ImGui::GetContentRegionAvail();
             ImVec2 size = FitImageSize(avail, ct_volume.nx, ct_volume.ny, ct_volume.spacing[0], ct_volume.spacing[1]);
             ImGui::Image((ImTextureID)(intptr_t)axial_srv, size);
+
+            ImVec2 item_min = ImGui::GetItemRectMin();
+            int click_i, click_j;
+            if (PanelClicked(item_min, size, ct_volume.nx, ct_volume.ny, false, &click_i, &click_j))
+            {
+                cursor_i = click_i; cursor_j = click_j;
+                j_dirty = i_dirty = true; // coronal/sagittal now pass through a different point
+            }
+            DrawCrosshairAndReadout(item_min, size, ct_volume.nx, ct_volume.ny, cursor_i, cursor_j, false,
+                ct_volume, cursor_i, cursor_j, cursor_k);
         }
         else
         {
@@ -301,26 +382,35 @@ int main(int, char**)
         ImGui::Begin("Coronal");
         if (ct_loaded)
         {
-            bool changed = coronal_dirty;
-            changed |= ImGui::SliderInt("Slice", &coronal_slice, 0, ct_volume.ny - 1);
+            j_dirty |= ImGui::SliderInt("Slice", &cursor_j, 0, ct_volume.ny - 1);
 
             if (ImGui::IsWindowHovered() && io.MouseWheel != 0.0f)
             {
-                coronal_slice = std::clamp(coronal_slice - (int)io.MouseWheel, 0, ct_volume.ny - 1);
-                changed = true;
+                cursor_j = std::clamp(cursor_j - (int)io.MouseWheel, 0, ct_volume.ny - 1);
+                j_dirty = true;
             }
 
-            if (changed)
+            if (j_dirty)
             {
                 // width=x, height=z; row 0 = k=0 (inferior) -- flip via UV below so superior is on top.
                 UploadSlice(coronal_tex, ct_volume.nx, ct_volume.nz, window_width, window_level,
-                    [&](int i, int k) { return ct_volume.At(i, coronal_slice, k); });
-                coronal_dirty = false;
+                    [&](int i, int k) { return ct_volume.At(i, cursor_j, k); });
+                j_dirty = false;
             }
 
             ImVec2 avail = ImGui::GetContentRegionAvail();
             ImVec2 size = FitImageSize(avail, ct_volume.nx, ct_volume.nz, ct_volume.spacing[0], ct_volume.spacing[2]);
             ImGui::Image((ImTextureID)(intptr_t)coronal_srv, size, ImVec2(0, 1), ImVec2(1, 0));
+
+            ImVec2 item_min = ImGui::GetItemRectMin();
+            int click_i, click_k;
+            if (PanelClicked(item_min, size, ct_volume.nx, ct_volume.nz, true, &click_i, &click_k))
+            {
+                cursor_i = click_i; cursor_k = click_k;
+                i_dirty = k_dirty = true;
+            }
+            DrawCrosshairAndReadout(item_min, size, ct_volume.nx, ct_volume.nz, cursor_i, cursor_k, true,
+                ct_volume, cursor_i, cursor_j, cursor_k);
         }
         else
         {
@@ -331,26 +421,35 @@ int main(int, char**)
         ImGui::Begin("Sagittal");
         if (ct_loaded)
         {
-            bool changed = sagittal_dirty;
-            changed |= ImGui::SliderInt("Slice", &sagittal_slice, 0, ct_volume.nx - 1);
+            i_dirty |= ImGui::SliderInt("Slice", &cursor_i, 0, ct_volume.nx - 1);
 
             if (ImGui::IsWindowHovered() && io.MouseWheel != 0.0f)
             {
-                sagittal_slice = std::clamp(sagittal_slice - (int)io.MouseWheel, 0, ct_volume.nx - 1);
-                changed = true;
+                cursor_i = std::clamp(cursor_i - (int)io.MouseWheel, 0, ct_volume.nx - 1);
+                i_dirty = true;
             }
 
-            if (changed)
+            if (i_dirty)
             {
                 // width=y, height=z; same vertical flip as coronal (superior on top).
                 UploadSlice(sagittal_tex, ct_volume.ny, ct_volume.nz, window_width, window_level,
-                    [&](int j, int k) { return ct_volume.At(sagittal_slice, j, k); });
-                sagittal_dirty = false;
+                    [&](int j, int k) { return ct_volume.At(cursor_i, j, k); });
+                i_dirty = false;
             }
 
             ImVec2 avail = ImGui::GetContentRegionAvail();
             ImVec2 size = FitImageSize(avail, ct_volume.ny, ct_volume.nz, ct_volume.spacing[1], ct_volume.spacing[2]);
             ImGui::Image((ImTextureID)(intptr_t)sagittal_srv, size, ImVec2(0, 1), ImVec2(1, 0));
+
+            ImVec2 item_min = ImGui::GetItemRectMin();
+            int click_j, click_k;
+            if (PanelClicked(item_min, size, ct_volume.ny, ct_volume.nz, true, &click_j, &click_k))
+            {
+                cursor_j = click_j; cursor_k = click_k;
+                j_dirty = k_dirty = true;
+            }
+            DrawCrosshairAndReadout(item_min, size, ct_volume.ny, ct_volume.nz, cursor_j, cursor_k, true,
+                ct_volume, cursor_i, cursor_j, cursor_k);
         }
         else
         {
@@ -359,7 +458,24 @@ int main(int, char**)
         ImGui::End();
 
         ImGui::Begin("3D");
-        ImGui::TextUnformatted("3D render - placeholder");
+        if (ct_loaded)
+        {
+            if (mip_dirty)
+            {
+                UploadSlice(mip_tex, ct_volume.nx, ct_volume.nz, window_width, window_level,
+                    [&](int i, int k) { return frontal_mip[(size_t)k * ct_volume.nx + i]; });
+                mip_dirty = false;
+            }
+
+            ImGui::TextUnformatted("Frontal MIP (TODO: replace with a GPU volume raycast)");
+            ImVec2 avail = ImGui::GetContentRegionAvail();
+            ImVec2 size = FitImageSize(avail, ct_volume.nx, ct_volume.nz, ct_volume.spacing[0], ct_volume.spacing[2]);
+            ImGui::Image((ImTextureID)(intptr_t)mip_srv, size, ImVec2(0, 1), ImVec2(1, 0));
+        }
+        else
+        {
+            ImGui::TextUnformatted("3D render - failed to load CT volume, see console");
+        }
         ImGui::End();
 
         ImGui::Render();
@@ -381,6 +497,8 @@ int main(int, char**)
     if (coronal_tex) coronal_tex->Release();
     if (sagittal_srv) sagittal_srv->Release();
     if (sagittal_tex) sagittal_tex->Release();
+    if (mip_srv) mip_srv->Release();
+    if (mip_tex) mip_tex->Release();
 
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
