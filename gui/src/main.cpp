@@ -83,27 +83,43 @@ static bool CreateSliceTexture(int width, int height, ID3D11Texture2D** out_tex,
 }
 
 // Windows HU to a grayscale byte: (hu - (wl - ww/2)) / ww, clamped to [0,1].
-static void UploadAxialSlice(ID3D11Texture2D* tex, const Volume& vol, int slice, float window_width, float window_level)
+// `get_voxel(col, row)` picks the plane; callers below index the volume
+// differently for axial/coronal/sagittal but share this upload path.
+template <typename GetVoxel>
+static void UploadSlice(ID3D11Texture2D* tex, int width, int height, float window_width, float window_level, GetVoxel get_voxel)
 {
     D3D11_MAPPED_SUBRESOURCE mapped;
     if (FAILED(g_pd3dDeviceContext->Map(tex, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
         return;
 
     const float lo = window_level - window_width * 0.5f;
-    for (int j = 0; j < vol.ny; ++j)
+    for (int row = 0; row < height; ++row)
     {
-        uint8_t* row = (uint8_t*)mapped.pData + (size_t)j * mapped.RowPitch; // honour RowPitch, never assume width*bpp
-        for (int i = 0; i < vol.nx; ++i)
+        uint8_t* dst = (uint8_t*)mapped.pData + (size_t)row * mapped.RowPitch; // honour RowPitch, never assume width*bpp
+        for (int col = 0; col < width; ++col)
         {
-            float t = (vol.At(i, j, slice) - lo) / window_width;
+            float t = (get_voxel(col, row) - lo) / window_width;
             uint8_t gray = (uint8_t)(std::clamp(t, 0.0f, 1.0f) * 255.0f + 0.5f);
-            row[i * 4 + 0] = gray;
-            row[i * 4 + 1] = gray;
-            row[i * 4 + 2] = gray;
-            row[i * 4 + 3] = 255;
+            dst[col * 4 + 0] = gray;
+            dst[col * 4 + 1] = gray;
+            dst[col * 4 + 2] = gray;
+            dst[col * 4 + 3] = 255;
         }
     }
     g_pd3dDeviceContext->Unmap(tex, 0);
+}
+
+// Fits a (tex_w x tex_h) image with physical pixel spacing (sp_w, sp_h) into
+// `avail`, preserving the real-world aspect ratio so anisotropic spacing
+// (e.g. thicker slice pitch than in-plane pixel size) doesn't stretch it.
+static ImVec2 FitImageSize(ImVec2 avail, int tex_w, int tex_h, double sp_w, double sp_h)
+{
+    float phys_w = (float)(tex_w * sp_w);
+    float phys_h = (float)(tex_h * sp_h);
+    float scale = std::min(avail.x / phys_w, avail.y / phys_h);
+    if (!(scale > 0.0f))
+        scale = 1.0f;
+    return ImVec2(phys_w * scale, phys_h * scale);
 }
 
 int main(int, char**)
@@ -144,26 +160,40 @@ int main(int, char**)
     ImVec4 clear_color = ImVec4(0.10f, 0.10f, 0.12f, 1.00f);
 
     // Milestone 1: hardcode the phantom CT path (see source/export_gui_volume.py).
+    // Orthogonal MPR only: slicing below assumes an axis-aligned volume
+    // (identity direction matrix) and ignores Volume::direction entirely.
+    // Oblique reformatting would need a resample through that matrix - deferred.
     Volume ct_volume;
     bool ct_loaded = LoadVolume(std::string(DICOM_RT_DATA_DIR) + "/phantom/gui_export/ct", ct_volume);
 
     ID3D11Texture2D* axial_tex = nullptr;
     ID3D11ShaderResourceView* axial_srv = nullptr;
-    int axial_slice = 0;
-    float window_width = 400.0f, window_level = 40.0f; // soft tissue preset
-    bool axial_dirty = true;
+    ID3D11Texture2D* coronal_tex = nullptr;
+    ID3D11ShaderResourceView* coronal_srv = nullptr;
+    ID3D11Texture2D* sagittal_tex = nullptr;
+    ID3D11ShaderResourceView* sagittal_srv = nullptr;
+
+    int axial_slice = 0;    // k (z index)
+    int coronal_slice = 0;  // j (y index)
+    int sagittal_slice = 0; // i (x index)
+    float window_width = 400.0f, window_level = 40.0f; // soft tissue preset, shared across planes
+    bool axial_dirty = true, coronal_dirty = true, sagittal_dirty = true;
 
     if (ct_loaded)
     {
         axial_slice = ct_volume.nz / 2;
+        coronal_slice = ct_volume.ny / 2;
+        sagittal_slice = ct_volume.nx / 2;
         auto [min_it, max_it] = std::minmax_element(ct_volume.data.begin(), ct_volume.data.end());
         printf("Loaded CT volume: %dx%dx%d spacing=(%.3f,%.3f,%.3f) HU range=[%d,%d]\n",
             ct_volume.nx, ct_volume.ny, ct_volume.nz,
             ct_volume.spacing[0], ct_volume.spacing[1], ct_volume.spacing[2],
             (int)*min_it, (int)*max_it);
-        if (!CreateSliceTexture(ct_volume.nx, ct_volume.ny, &axial_tex, &axial_srv))
+        if (!CreateSliceTexture(ct_volume.nx, ct_volume.ny, &axial_tex, &axial_srv) ||
+            !CreateSliceTexture(ct_volume.nx, ct_volume.nz, &coronal_tex, &coronal_srv) ||
+            !CreateSliceTexture(ct_volume.ny, ct_volume.nz, &sagittal_tex, &sagittal_srv))
         {
-            fprintf(stderr, "Failed to create axial slice texture\n");
+            fprintf(stderr, "Failed to create slice textures\n");
             ct_loaded = false;
         }
     }
@@ -226,35 +256,41 @@ int main(int, char**)
         ImGui::Begin("Axial");
         if (ct_loaded)
         {
-            bool changed = axial_dirty;
-            changed |= ImGui::SliderInt("Slice", &axial_slice, 0, ct_volume.nz - 1);
-            changed |= ImGui::SliderFloat("Width", &window_width, 1.0f, 4000.0f, "%.0f");
-            changed |= ImGui::SliderFloat("Level", &window_level, -1000.0f, 1000.0f, "%.0f");
+            bool slice_changed = axial_dirty;
+            slice_changed |= ImGui::SliderInt("Slice", &axial_slice, 0, ct_volume.nz - 1);
 
-            if (ImGui::Button("Soft 400/40")) { window_width = 400; window_level = 40; changed = true; }
+            bool wl_changed = false;
+            wl_changed |= ImGui::SliderFloat("Width", &window_width, 1.0f, 4000.0f, "%.0f");
+            wl_changed |= ImGui::SliderFloat("Level", &window_level, -1000.0f, 1000.0f, "%.0f");
+
+            if (ImGui::Button("Soft 400/40")) { window_width = 400; window_level = 40; wl_changed = true; }
             ImGui::SameLine();
-            if (ImGui::Button("Lung 1500/-600")) { window_width = 1500; window_level = -600; changed = true; }
+            if (ImGui::Button("Lung 1500/-600")) { window_width = 1500; window_level = -600; wl_changed = true; }
             ImGui::SameLine();
-            if (ImGui::Button("Bone 2000/500")) { window_width = 2000; window_level = 500; changed = true; }
+            if (ImGui::Button("Bone 2000/500")) { window_width = 2000; window_level = 500; wl_changed = true; }
             ImGui::SameLine();
-            if (ImGui::Button("Brain 80/40")) { window_width = 80; window_level = 40; changed = true; }
+            if (ImGui::Button("Brain 80/40")) { window_width = 80; window_level = 40; wl_changed = true; }
 
             if (ImGui::IsWindowHovered() && io.MouseWheel != 0.0f)
             {
                 axial_slice = std::clamp(axial_slice - (int)io.MouseWheel, 0, ct_volume.nz - 1);
-                changed = true;
+                slice_changed = true;
             }
 
-            if (changed)
+            // W/L is shared across all three planes, so a change here dirties them too.
+            if (wl_changed)
+                coronal_dirty = sagittal_dirty = true;
+
+            if (slice_changed || wl_changed)
             {
-                UploadAxialSlice(axial_tex, ct_volume, axial_slice, window_width, window_level);
+                UploadSlice(axial_tex, ct_volume.nx, ct_volume.ny, window_width, window_level,
+                    [&](int i, int j) { return ct_volume.At(i, j, axial_slice); });
                 axial_dirty = false;
             }
 
             ImVec2 avail = ImGui::GetContentRegionAvail();
-            float scale = std::min(avail.x / (float)ct_volume.nx, avail.y / (float)ct_volume.ny);
-            scale = scale > 0.0f ? scale : 1.0f;
-            ImGui::Image((ImTextureID)(intptr_t)axial_srv, ImVec2(ct_volume.nx * scale, ct_volume.ny * scale));
+            ImVec2 size = FitImageSize(avail, ct_volume.nx, ct_volume.ny, ct_volume.spacing[0], ct_volume.spacing[1]);
+            ImGui::Image((ImTextureID)(intptr_t)axial_srv, size);
         }
         else
         {
@@ -263,11 +299,63 @@ int main(int, char**)
         ImGui::End();
 
         ImGui::Begin("Coronal");
-        ImGui::TextUnformatted("Coronal (frontal) - placeholder");
+        if (ct_loaded)
+        {
+            bool changed = coronal_dirty;
+            changed |= ImGui::SliderInt("Slice", &coronal_slice, 0, ct_volume.ny - 1);
+
+            if (ImGui::IsWindowHovered() && io.MouseWheel != 0.0f)
+            {
+                coronal_slice = std::clamp(coronal_slice - (int)io.MouseWheel, 0, ct_volume.ny - 1);
+                changed = true;
+            }
+
+            if (changed)
+            {
+                // width=x, height=z; row 0 = k=0 (inferior) -- flip via UV below so superior is on top.
+                UploadSlice(coronal_tex, ct_volume.nx, ct_volume.nz, window_width, window_level,
+                    [&](int i, int k) { return ct_volume.At(i, coronal_slice, k); });
+                coronal_dirty = false;
+            }
+
+            ImVec2 avail = ImGui::GetContentRegionAvail();
+            ImVec2 size = FitImageSize(avail, ct_volume.nx, ct_volume.nz, ct_volume.spacing[0], ct_volume.spacing[2]);
+            ImGui::Image((ImTextureID)(intptr_t)coronal_srv, size, ImVec2(0, 1), ImVec2(1, 0));
+        }
+        else
+        {
+            ImGui::TextUnformatted("Coronal (frontal) - failed to load CT volume, see console");
+        }
         ImGui::End();
 
         ImGui::Begin("Sagittal");
-        ImGui::TextUnformatted("Sagittal - placeholder");
+        if (ct_loaded)
+        {
+            bool changed = sagittal_dirty;
+            changed |= ImGui::SliderInt("Slice", &sagittal_slice, 0, ct_volume.nx - 1);
+
+            if (ImGui::IsWindowHovered() && io.MouseWheel != 0.0f)
+            {
+                sagittal_slice = std::clamp(sagittal_slice - (int)io.MouseWheel, 0, ct_volume.nx - 1);
+                changed = true;
+            }
+
+            if (changed)
+            {
+                // width=y, height=z; same vertical flip as coronal (superior on top).
+                UploadSlice(sagittal_tex, ct_volume.ny, ct_volume.nz, window_width, window_level,
+                    [&](int j, int k) { return ct_volume.At(sagittal_slice, j, k); });
+                sagittal_dirty = false;
+            }
+
+            ImVec2 avail = ImGui::GetContentRegionAvail();
+            ImVec2 size = FitImageSize(avail, ct_volume.ny, ct_volume.nz, ct_volume.spacing[1], ct_volume.spacing[2]);
+            ImGui::Image((ImTextureID)(intptr_t)sagittal_srv, size, ImVec2(0, 1), ImVec2(1, 0));
+        }
+        else
+        {
+            ImGui::TextUnformatted("Sagittal - failed to load CT volume, see console");
+        }
         ImGui::End();
 
         ImGui::Begin("3D");
@@ -289,6 +377,10 @@ int main(int, char**)
 
     if (axial_srv) axial_srv->Release();
     if (axial_tex) axial_tex->Release();
+    if (coronal_srv) coronal_srv->Release();
+    if (coronal_tex) coronal_tex->Release();
+    if (sagittal_srv) sagittal_srv->Release();
+    if (sagittal_tex) sagittal_tex->Release();
 
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
