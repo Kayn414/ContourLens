@@ -269,8 +269,18 @@ static void DrawSlicePlaneOutline(ImVec2 item_min, ImVec2 item_size, const Camer
     draw_list->AddPolyline(screen, 4, color, ImDrawFlags_Closed, 2.0f);
 }
 
-int main(int, char**)
+int main(int argc, char** argv)
 {
+    // Optional argv[1]: a case directory under <repo>/data, e.g. "phantom"
+    // (default) or "hanseg_cases/case_03" - see source/export_gui_volume.py.
+    // The plan doc flagged this as the natural next step past a hardcoded
+    // path: "plan a later argv[1] + file dialog."
+    std::string case_dir = (argc > 1) ? argv[1] : "phantom";
+    std::string case_data_dir = std::string(DICOM_RT_DATA_DIR) + "/" + case_dir + "/gui_export";
+
+    std::wstring window_title = L"DICOM RT Viewer - ";
+    for (char c : case_dir) window_title += (wchar_t)c; // case_dir is plain ASCII in practice
+
     WNDCLASSEXW wc = {
         sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L,
         GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr,
@@ -278,7 +288,7 @@ int main(int, char**)
     };
     ::RegisterClassExW(&wc);
     HWND hwnd = ::CreateWindowW(
-        wc.lpszClassName, L"DICOM RT Viewer", WS_OVERLAPPEDWINDOW,
+        wc.lpszClassName, window_title.c_str(), WS_OVERLAPPEDWINDOW,
         100, 100, 1280, 800, nullptr, nullptr, wc.hInstance, nullptr);
 
     if (!CreateDeviceD3D(hwnd))
@@ -307,12 +317,12 @@ int main(int, char**)
     bool dock_layout_built = false;
     ImVec4 clear_color = ImVec4(0.10f, 0.10f, 0.12f, 1.00f);
 
-    // Milestone 1: hardcode the phantom CT path (see source/export_gui_volume.py).
+    // Loads whichever case argv[1] selected (see source/export_gui_volume.py).
     // Orthogonal MPR only: slicing below assumes an axis-aligned volume
     // (identity direction matrix) and ignores Volume::direction entirely.
     // Oblique reformatting would need a resample through that matrix - deferred.
     Volume ct_volume;
-    bool ct_loaded = LoadVolume(std::string(DICOM_RT_DATA_DIR) + "/phantom/gui_export/ct", ct_volume);
+    bool ct_loaded = LoadVolume(case_data_dir + "/ct", ct_volume);
 
     ID3D11Texture2D* axial_tex = nullptr;
     ID3D11ShaderResourceView* axial_srv = nullptr;
@@ -387,7 +397,7 @@ int main(int, char**)
         if (!raycaster_ok)
             fprintf(stderr, "Failed to initialize the GPU raycaster; 3D panel will be unavailable\n");
 
-        masks_loaded = LoadLabelVolume(std::string(DICOM_RT_DATA_DIR) + "/phantom/gui_export/masks", label_volume);
+        masks_loaded = LoadLabelVolume(case_data_dir + "/masks", label_volume);
         if (masks_loaded && (label_volume.nx != ct_volume.nx || label_volume.ny != ct_volume.ny || label_volume.nz != ct_volume.nz))
         {
             fprintf(stderr, "Mask volume shape %dx%dx%d doesn't match CT shape %dx%dx%d; disabling overlays\n",
@@ -400,7 +410,7 @@ int main(int, char**)
             label_colors = BuildLabelColors(label_volume.labels);
 
             DoseVolume dose_volume;
-            bool real_dose_loaded = LoadDoseVolume(std::string(DICOM_RT_DATA_DIR) + "/phantom/gui_export/dose", dose_volume);
+            bool real_dose_loaded = LoadDoseVolume(case_data_dir + "/dose", dose_volume);
             if (real_dose_loaded && (dose_volume.nx != ct_volume.nx || dose_volume.ny != ct_volume.ny || dose_volume.nz != ct_volume.nz))
             {
                 fprintf(stderr, "Dose volume shape %dx%dx%d doesn't match CT shape %dx%dx%d; ignoring it\n",
@@ -426,7 +436,7 @@ int main(int, char**)
         }
 
         // A prediction from a previous "Run Inference" click may already be on disk.
-        prediction_loaded = LoadLabelVolume(std::string(DICOM_RT_DATA_DIR) + "/phantom/gui_export/prediction", prediction_volume);
+        prediction_loaded = LoadLabelVolume(case_data_dir + "/prediction", prediction_volume);
         if (prediction_loaded && (prediction_volume.nx != ct_volume.nx || prediction_volume.ny != ct_volume.ny || prediction_volume.nz != ct_volume.nz))
         {
             fprintf(stderr, "Prediction volume shape %dx%dx%d doesn't match CT shape %dx%dx%d; ignoring it\n",
@@ -490,7 +500,7 @@ int main(int, char**)
         {
             if (inference_job.exit_code == 0)
             {
-                prediction_loaded = LoadLabelVolume(std::string(DICOM_RT_DATA_DIR) + "/phantom/gui_export/prediction", prediction_volume);
+                prediction_loaded = LoadLabelVolume(case_data_dir + "/prediction", prediction_volume);
                 if (prediction_loaded && (prediction_volume.nx != ct_volume.nx || prediction_volume.ny != ct_volume.ny || prediction_volume.nz != ct_volume.nz))
                 {
                     fprintf(stderr, "Prediction volume shape %dx%dx%d doesn't match CT shape %dx%dx%d; ignoring it\n",
@@ -813,7 +823,7 @@ int main(int, char**)
                 if (dvh_dose_is_synthetic)
                     ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Synthetic dose (Gaussian blob) - NOT a real treatment plan.");
                 else
-                    ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "Dose: data/phantom/gui_export/dose (real RTDOSE export)");
+                    ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "Dose: %s/dose (real RTDOSE export)", case_data_dir.c_str());
                 if (ImPlot::BeginPlot("Dose-Volume Histogram", ImVec2(-1, -1)))
                 {
                     ImPlot::SetupAxes("Dose (Gy)", "Volume (%)");
