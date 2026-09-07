@@ -934,7 +934,7 @@ int main(int argc, char** argv)
             {
                 ImGui::BeginDisabled(inference_job.running);
                 if (ImGui::Button("Run Inference"))
-                    StartInferenceJob(inference_job, DICOM_RT_REPO_DIR);
+                    StartInferenceJob(inference_job, DICOM_RT_REPO_DIR, case_dir);
                 ImGui::EndDisabled();
                 if (inference_job.running)
                 {

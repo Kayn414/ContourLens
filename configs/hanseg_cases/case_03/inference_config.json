@@ -1,0 +1,16 @@
+{
+  "backend": "local",
+  "source_ct": "data/nnUNet_raw/Dataset501_HanSeg/imagesTr/case_03_0000.nii.gz",
+  "model": {
+    "dataset_id": "501",
+    "configuration": "3d_fullres",
+    "trainer": "nnUNetTrainer_500epochs",
+    "plans": "nnUNetPlans",
+    "folds": [0, 1, 2, 3],
+    "results_dir": null
+  },
+  "modal": {
+    "app_name": "nnunet-training",
+    "function_name": "predict_nifti_bytes"
+  }
+}

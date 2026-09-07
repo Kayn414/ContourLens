@@ -156,6 +156,59 @@ def predict_case(
 
 
 # ============================================================
+# 2c. Predict (arbitrary CT bytes) -- the GUI's "modal" inference backend
+# ============================================================
+# Unlike predict_case, this doesn't assume the CT is already staged on the
+# raw volume: it takes the NIfTI file's bytes directly as an argument, so it
+# works for a user's own dataset (source/inference_backends.py's run_modal
+# re-encodes whatever format -- DICOM dir, NRRD, NIfTI -- through
+# SimpleITK first). Only the trained model needs to already exist on the
+# results volume, at the usual nnU-Net layout for the given
+# dataset_id/trainer/plans/configuration. Must be `modal deploy`ed (not just
+# `modal run`) for Function.from_name() to find it from an ad hoc script.
+@app.function(
+    image=image,
+    gpu=GPU,
+    cpu=8,
+    memory=32768,
+    volumes={VOL_RESULTS: results_vol},
+    timeout=60 * 60,
+)
+def predict_nifti_bytes(
+    nifti_bytes: bytes,
+    dataset_id: str = str(DATASET_ID),
+    configuration: str = CONFIGURATION,
+    folds: str = ",".join(str(f) for f in PRODUCTION_FOLDS),
+    trainer: str = PRODUCTION_TRAINER,
+    plans: str = PLANS,
+) -> bytes:
+    """Predicts one CT given as raw NIfTI bytes; returns the prediction's
+    NIfTI bytes directly (no volume round-trip needed for ad hoc data)."""
+    import subprocess
+    from pathlib import Path
+
+    input_dir = Path("/tmp/predict_input")
+    output_dir = Path("/tmp/predict_output")
+    input_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    case_id = "case"
+    (input_dir / f"{case_id}_0000.nii.gz").write_bytes(nifti_bytes)
+
+    cmd = [
+        "nnUNetv2_predict",
+        "-i", str(input_dir), "-o", str(output_dir),
+        "-d", str(dataset_id), "-c", configuration,
+        "-f", *folds.split(","),
+        "-tr", trainer, "-p", plans,
+    ]
+    print("Running:", " ".join(cmd))
+    subprocess.run(cmd, check=True)
+
+    return (output_dir / f"{case_id}.nii.gz").read_bytes()
+
+
+# ============================================================
 # 3. Train
 # ============================================================
 @app.function(

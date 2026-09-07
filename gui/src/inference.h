@@ -19,9 +19,11 @@ struct InferenceJob
     DWORD start_tick_ms = 0;
 };
 
-// Launches the child. Returns false (logging to stderr) if CreateProcess
-// fails outright; does nothing if a job is already running.
-bool StartInferenceJob(InferenceJob& job, const std::string& repo_dir);
+// Launches the child against the case named `case_name` (e.g. "phantom" or
+// "hanseg_cases/case_03" -- same name used for argv[1] and under data/ and
+// configs/; see source/inference_config.py). Returns false (logging to
+// stderr) if CreateProcess fails outright; does nothing if a job is already running.
+bool StartInferenceJob(InferenceJob& job, const std::string& repo_dir, const std::string& case_name);
 
 // Non-blocking: returns true exactly once, on the frame the job finishes
 // (check job.exit_code then). Returns false while running or idle.

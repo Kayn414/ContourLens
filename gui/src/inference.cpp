@@ -3,17 +3,18 @@
 #include <cstdio>
 #include <vector>
 
-bool StartInferenceJob(InferenceJob& job, const std::string& repo_dir)
+bool StartInferenceJob(InferenceJob& job, const std::string& repo_dir, const std::string& case_name)
 {
     if (job.running)
         return false;
 
-    // Widen repo_dir (ASCII Windows paths in practice) without pulling in <filesystem>.
+    // Widen repo_dir/case_name (ASCII in practice) without pulling in <filesystem>.
     std::wstring cwd(repo_dir.begin(), repo_dir.end());
+    std::wstring case_name_w(case_name.begin(), case_name.end());
 
     // Runs in the same console as the GUI (no CREATE_NEW_CONSOLE) so nnU-Net's
     // (verbose) progress output is visible somewhere while the job runs.
-    std::wstring command = L"cmd /c \"uv run python -m source.run_inference_for_gui\"";
+    std::wstring command = L"cmd /c \"uv run python -m source.run_inference_for_gui " + case_name_w + L"\"";
     std::vector<wchar_t> command_buf(command.begin(), command.end());
     command_buf.push_back(L'\0');
 
