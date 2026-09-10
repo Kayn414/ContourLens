@@ -49,6 +49,8 @@ std::vector<DVHCurve> ComputeDVHCurves(const std::vector<float>& dose, const Lab
     if (max_dose <= 0.0f) max_dose = 1.0f;
 
     std::vector<size_t> structure_voxels(num_labels, 0);
+    std::vector<double> dose_sum(num_labels, 0.0);
+    std::vector<float> dose_max(num_labels, 0.0f);
     std::vector<std::vector<size_t>> histogram(num_labels, std::vector<size_t>(num_bins, 0));
 
     for (size_t idx = 0; idx < voxel_count; ++idx)
@@ -58,6 +60,8 @@ std::vector<DVHCurve> ComputeDVHCurves(const std::vector<float>& dose, const Lab
             continue;
         size_t li = label - 1;
         structure_voxels[li]++;
+        dose_sum[li] += dose[idx];
+        dose_max[li] = std::max(dose_max[li], dose[idx]);
         int bin = (int)std::clamp((dose[idx] / max_dose) * num_bins, 0.0f, (float)(num_bins - 1));
         histogram[li][bin]++;
     }
@@ -66,6 +70,8 @@ std::vector<DVHCurve> ComputeDVHCurves(const std::vector<float>& dose, const Lab
     for (size_t li = 0; li < num_labels; ++li)
     {
         curves[li].name = labels.labels[li];
+        curves[li].mean_gy = structure_voxels[li] > 0 ? (float)(dose_sum[li] / structure_voxels[li]) : 0.0f;
+        curves[li].max_gy = dose_max[li];
         curves[li].dose_gy.resize(num_bins);
         curves[li].volume_pct.resize(num_bins);
 

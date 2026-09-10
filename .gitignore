@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 .ruff_cache/
 *.egg-info/
+.vscode/
 
 # Generated artifacts
 ct_slice.png
@@ -17,3 +18,10 @@ out/
 
 # Data (large / externally-sourced fixtures - see data/SlicerRtData/Links.txt)
 data/
+
+# Per-user inference configs for cases created by dragging data into the GUI
+# (source/gui_load.py) -- machine-specific absolute source_ct paths, not shared fixtures.
+configs/user/
+
+# Agents
+.claude/

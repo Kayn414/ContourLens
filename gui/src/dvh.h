@@ -17,6 +17,8 @@ struct DVHCurve
     std::string name;
     std::vector<float> dose_gy;     // bin edges, ascending
     std::vector<float> volume_pct;  // % of the structure's volume receiving >= dose_gy[bin]
+    float mean_gy = 0.0f;           // Dmean over the structure's voxels (0 if empty)
+    float max_gy = 0.0f;            // Dmax
 };
 
 // One float per voxel (same (k, j, i) order as Volume/LabelVolume), Gy.

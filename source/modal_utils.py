@@ -113,7 +113,7 @@ def submit_commands(commands: list[list[str]]) -> None:
         try:
             result = fc.get()
             print(f"Completed: {result}", flush=True)
-        except BaseException as exc:  # noqa: BLE001 - report and continue to next job
+        except BaseException as exc:  
             print(f"Failed: {command_str}", flush=True)
             print(f"Error: {exc!r}", flush=True)
             failures.append(command_str)

@@ -1,4 +1,4 @@
-"""Run nnU-Net inference on the phantom CT and produce a multi-label prediction.
+"""Run nnU-Net inference and produce a multi-label prediction.
 
 Requires a trained model under nnUNet_results (locally via scripts/train_nnunet.sh,
 or downloaded from the Modal results volume -- see source/modal_nnunet.py).
@@ -13,7 +13,7 @@ from source.data.phantom import NNUNET_INPUT_DIR, build_ct_nifti
 
 CONFIGURATION = "3d_fullres"
 # Matches the completed production run (source/modal_nnunet.py's
-# PRODUCTION_TRAINER/PRODUCTION_FOLDS) -- fold 4 was skipped for budget.
+# PRODUCTION_TRAINER/PRODUCTION_FOLDS)
 TRAINER = "nnUNetTrainer_500epochs"
 PLANS = "nnUNetPlans"
 FOLDS = ("0", "1", "2", "3")

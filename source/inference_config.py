@@ -86,3 +86,30 @@ def write_config(case_name: str, config: InferenceConfig) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(asdict(config), indent=2))
     return path
+
+
+def resolve_label_ids(model: ModelConfig) -> dict[str, int]:
+    """Reads {structure_name: label_id} straight from the trained model's own
+    dataset.json (nnU-Net writes one alongside every trained model, at
+    <results_dir>/Dataset<id>_<Name>/<trainer>__<plans>__<configuration>/dataset.json)
+    """
+    from source.data.nnunet_dataset import resolve_nnunet_results
+
+    results_dir = Path(model.results_dir) if model.results_dir else resolve_nnunet_results()
+    dataset_id = int(model.dataset_id)
+    matches = sorted(results_dir.glob(f"Dataset{dataset_id:03d}_*"))
+    if not matches:
+        raise FileNotFoundError(
+            f"No Dataset{dataset_id:03d}_* folder under {results_dir} -- check "
+            "inference_config.json's model.dataset_id/results_dir."
+        )
+
+    dataset_json = matches[0] / f"{model.trainer}__{model.plans}__{model.configuration}" / "dataset.json"
+    if not dataset_json.exists():
+        raise FileNotFoundError(
+            f"{dataset_json} not found -- check model.trainer/plans/configuration "
+            "in inference_config.json."
+        )
+
+    labels = json.loads(dataset_json.read_text())["labels"]
+    return {name: label_id for name, label_id in labels.items() if name != "background"}

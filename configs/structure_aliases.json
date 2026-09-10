@@ -1,0 +1,4 @@
+{
+  "_comment": "Structure-name aliases shared by the GUI's Metrics table (gui/src/structure_metrics.cpp) and source/structure_names.py. Two names refer to the same structure when their normalized forms (lowercase alphanumerics only) match after mapping through this table. Seeded from source/data/hanseg.py CANONICAL_LABELS and source/data/phantom.py OAR_NAME_MAP; the GUI's 'Pair with...' adds entries.",
+  "aliases": {}
+}

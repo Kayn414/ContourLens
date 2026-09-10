@@ -1,11 +1,15 @@
 #include "volume.h"
 
+#include <algorithm>
 #include <fstream>
 #include <iostream>
 
 #include <nlohmann/json.hpp>
 
-bool LoadVolume(const std::string& base_path, Volume& out)
+// Each public loader wraps its *Impl in a catch for nlohmann's exceptions, so
+// a malformed or half-written sidecar logs and returns false instead of
+// terminating the GUI (these files now also come from user-dropped data).
+static bool LoadVolumeImpl(const std::string& base_path, Volume& out)
 {
     std::ifstream json_file(base_path + ".json");
     if (!json_file)
@@ -67,7 +71,7 @@ bool LoadVolume(const std::string& base_path, Volume& out)
     return true;
 }
 
-bool LoadLabelVolume(const std::string& base_path, LabelVolume& out)
+static bool LoadLabelVolumeImpl(const std::string& base_path, LabelVolume& out)
 {
     std::ifstream json_file(base_path + ".json");
     if (!json_file)
@@ -115,11 +119,16 @@ bool LoadLabelVolume(const std::string& base_path, LabelVolume& out)
         return false;
     }
 
+    // Every id present must have a name: callers index labels[id - 1] unchecked.
+    uint8_t max_id = labels.data.empty() ? 0 : *std::max_element(labels.data.begin(), labels.data.end());
+    while (labels.labels.size() < max_id)
+        labels.labels.push_back("label_" + std::to_string(labels.labels.size() + 1));
+
     out = std::move(labels);
     return true;
 }
 
-bool LoadDoseVolume(const std::string& base_path, DoseVolume& out)
+static bool LoadDoseVolumeImpl(const std::string& base_path, DoseVolume& out)
 {
     std::ifstream json_file(base_path + ".json");
     if (!json_file)
@@ -168,4 +177,34 @@ bool LoadDoseVolume(const std::string& base_path, DoseVolume& out)
 
     out = std::move(dose);
     return true;
+}
+
+bool LoadVolume(const std::string& base_path, Volume& out)
+{
+    try { return LoadVolumeImpl(base_path, out); }
+    catch (const nlohmann::json::exception& e)
+    {
+        std::cerr << "LoadVolume: malformed " << base_path << ".json: " << e.what() << "\n";
+        return false;
+    }
+}
+
+bool LoadLabelVolume(const std::string& base_path, LabelVolume& out)
+{
+    try { return LoadLabelVolumeImpl(base_path, out); }
+    catch (const nlohmann::json::exception& e)
+    {
+        std::cerr << "LoadLabelVolume: malformed " << base_path << ".json: " << e.what() << "\n";
+        return false;
+    }
+}
+
+bool LoadDoseVolume(const std::string& base_path, DoseVolume& out)
+{
+    try { return LoadDoseVolumeImpl(base_path, out); }
+    catch (const nlohmann::json::exception& e)
+    {
+        std::cerr << "LoadDoseVolume: malformed " << base_path << ".json: " << e.what() << "\n";
+        return false;
+    }
 }

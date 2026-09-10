@@ -33,6 +33,8 @@ add_executable(dicom_rt_gui
   src/raycaster.cpp
   src/dvh.cpp
   src/inference.cpp
+  src/inference_config.cpp
+  src/structure_metrics.cpp
   ${imgui_SOURCE_DIR}/imgui.cpp
   ${imgui_SOURCE_DIR}/imgui_draw.cpp
   ${imgui_SOURCE_DIR}/imgui_tables.cpp
@@ -40,6 +42,7 @@ add_executable(dicom_rt_gui
   ${imgui_SOURCE_DIR}/imgui_demo.cpp
   ${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp
   ${imgui_SOURCE_DIR}/backends/imgui_impl_dx11.cpp
+  ${imgui_SOURCE_DIR}/misc/cpp/imgui_stdlib.cpp
   ${implot_SOURCE_DIR}/implot.cpp
   ${implot_SOURCE_DIR}/implot_items.cpp
 )
@@ -47,10 +50,12 @@ add_executable(dicom_rt_gui
 target_include_directories(dicom_rt_gui PRIVATE
   ${imgui_SOURCE_DIR}
   ${imgui_SOURCE_DIR}/backends
+  ${imgui_SOURCE_DIR}/misc/cpp
   ${implot_SOURCE_DIR}
 )
 
-target_link_libraries(dicom_rt_gui PRIVATE d3d11.lib dxgi.lib d3dcompiler.lib nlohmann_json::nlohmann_json)
+# shell32: DragAcceptFiles/DragQueryFileW (drag-and-drop loading in main.cpp).
+target_link_libraries(dicom_rt_gui PRIVATE d3d11.lib dxgi.lib d3dcompiler.lib shell32.lib nlohmann_json::nlohmann_json)
 
 # Volume exports (source/export_gui_volume.py) live under <repo>/data, and
 # "Run Inference" (gui/src/inference.cpp) shells out to `uv run python -m

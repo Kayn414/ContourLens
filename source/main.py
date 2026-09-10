@@ -59,5 +59,4 @@ plt.imshow(
 plt.colorbar(label="HU")
 plt.imshow(hu, cmap="gray")
 plt.colorbar(label="HU")
-
 plt.savefig("ct_slice.png")

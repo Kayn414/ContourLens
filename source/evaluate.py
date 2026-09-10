@@ -1,10 +1,7 @@
-"""Score a model's phantom prediction against the ground-truth OAR masks
-pulled from the real Eclipse RTSTRUCT (source/data/phantom.py).
+"""Score a model's prediction against the ground-truth masks.
 
 Reports per-structure Dice and 95th-percentile Hausdorff distance (HD95).
-Structures with no ground truth in the phantom (spinal_cord — see
-phantom.py's docstring) or no prediction are reported as unscored rather
-than silently given a misleading 0.
+No predictions are reported as unscored rather than silently given a misleading 0.
 """
 
 import json
