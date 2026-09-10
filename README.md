@@ -1,4 +1,6 @@
 # ContourLens
+<img width="1919" height="1026" alt="image" src="https://github.com/user-attachments/assets/51ff63bc-ac5e-4784-9506-1950c85b81b1" />
+
 ## Project overview
 
 **ContourLens** is a radiotherapy imaging workbench for evaluating organ-at-risk
