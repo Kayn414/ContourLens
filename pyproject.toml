@@ -1,7 +1,7 @@
 [project]
 name = "source"
 version = "26.0.0"
-description = "dicom_rt"
+description = "ContourLens: evaluate and inspect radiotherapy segmentation models"
 requires-python = ">=3.12,<3.14"
 dependencies = [
     "einops>=0.8",      # tensor operations

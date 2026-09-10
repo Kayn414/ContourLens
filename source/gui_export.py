@@ -68,7 +68,7 @@ def export_rtstruct(
     with tempfile.TemporaryDirectory() as tmp:
         stage_dicom_series(series, Path(tmp))
         rtstruct = RTStructBuilder.create_new(dicom_series_path=tmp)
-        rtstruct.set_series_description("dicom_rt GUI prediction")
+        rtstruct.set_series_description("ContourLens prediction")
         written = 0
         for label_id, name in enumerate(labels, start=1):
             mask = native == label_id

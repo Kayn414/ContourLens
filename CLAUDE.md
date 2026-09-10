@@ -6,7 +6,7 @@ your way around the GUI.
 
 ## Project overview
 
-`dicom_rt` is a radiotherapy imaging workbench for evaluating organ-at-risk
+**ContourLens** is a radiotherapy imaging workbench for evaluating organ-at-risk
 (OAR) segmentation models:
 
 - **Python (`source/`)** reads DICOM / NIfTI / NRRD (pydicom, SimpleITK,
@@ -34,7 +34,7 @@ GUI launches every Python tool as `uv run python -m source.<module>`.
 uv sync                                          # Python env (Python >=3.12,<3.14) from uv.lock
 cmake --preset windows-x64                       # configure the GUI (VS 2022, output in gui/build)
 cmake --build gui/build --config Release         # build; close the GUI first (a running exe can't be relinked: LNK1104)
-gui/build/Release/dicom_rt_gui.exe               # opens case "phantom"; or pass a case name, e.g. user/case_09_0000
+gui/build/Release/ContourLens.exe                # opens case "phantom"; or pass a case name, e.g. user/case_09_0000
 ```
 
 `data/` is gitignored, so a fresh clone has no images, cases or model weights:
@@ -294,4 +294,4 @@ window got focus.
 - **RTSTRUCT export** needs a CT loaded from a DICOM series. NIfTI/NRRD cases export NIfTI only.
 - **Drag and drop** from Explorer doesn't reach the GUI if it runs elevated (Windows UIPI).
 - **Tests:** don't read `configs/structure_aliases.json` or other user-editable configs in tests; pass explicit alias tables or temp files.
-- **Rebuilding:** close `dicom_rt_gui.exe` first, or linking fails with LNK1104.
+- **Rebuilding:** close `ContourLens.exe` first, or linking fails with LNK1104.

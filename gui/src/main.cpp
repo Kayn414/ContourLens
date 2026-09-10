@@ -655,11 +655,11 @@ int main(int argc, char** argv)
     WNDCLASSEXW wc = {
         sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L,
         GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr,
-        L"DicomRtGuiWindowClass", nullptr
+        L"ContourLensWindowClass", nullptr
     };
     ::RegisterClassExW(&wc);
     HWND hwnd = ::CreateWindowW(
-        wc.lpszClassName, L"DICOM RT Viewer", WS_OVERLAPPEDWINDOW,
+        wc.lpszClassName, L"ContourLens", WS_OVERLAPPEDWINDOW,
         100, 100, 1280, 800, nullptr, nullptr, wc.hInstance, nullptr);
 
     if (!CreateDeviceD3D(hwnd))
@@ -1011,14 +1011,14 @@ int main(int argc, char** argv)
     auto LoadCase = [&](const std::string& new_case_dir, const std::string& dropped_source)
     {
         case_dir = new_case_dir;
-        case_data_dir = std::string(DICOM_RT_DATA_DIR) + "/" + case_dir + "/gui_export";
-        ::SetWindowTextW(hwnd, (L"DICOM RT Viewer - " + Utf8ToWide(case_dir)).c_str());
+        case_data_dir = std::string(CONTOURLENS_DATA_DIR) + "/" + case_dir + "/gui_export";
+        ::SetWindowTextW(hwnd, (L"ContourLens - " + Utf8ToWide(case_dir)).c_str());
 
-        LoadInferenceConfig(DICOM_RT_REPO_DIR, case_dir, inference_cfg);
+        LoadInferenceConfig(CONTOURLENS_REPO_DIR, case_dir, inference_cfg);
         if (!dropped_source.empty())
         {
             inference_cfg.source_ct = dropped_source;
-            SaveInferenceConfig(DICOM_RT_REPO_DIR, case_dir, inference_cfg);
+            SaveInferenceConfig(CONTOURLENS_REPO_DIR, case_dir, inference_cfg);
         }
         force_select_backend_tab = true;
 
@@ -1077,7 +1077,7 @@ int main(int argc, char** argv)
         job.title = "Loading CT";
         job.case_name = CaseNameForDroppedCt(path);
         job.source = path;
-        StartJob(job, DICOM_RT_REPO_DIR, "source.gui_load", { "ct", path, "--case", job.case_name });
+        StartJob(job, CONTOURLENS_REPO_DIR, "source.gui_load", { "ct", path, "--case", job.case_name });
     };
 
     auto StartLoadMasksJob = [&](const std::vector<std::string>& paths, bool as_prediction)
@@ -1089,16 +1089,16 @@ int main(int argc, char** argv)
         std::vector<std::string> args = { "masks" };
         args.insert(args.end(), paths.begin(), paths.end());
         args.insert(args.end(), { "--case", case_dir, "--slot", job.slot });
-        StartJob(job, DICOM_RT_REPO_DIR, "source.gui_load", args);
+        StartJob(job, CONTOURLENS_REPO_DIR, "source.gui_load", args);
     };
 
     auto StartInference = [&]()
     {
-        SaveInferenceConfig(DICOM_RT_REPO_DIR, case_dir, inference_cfg);
+        SaveInferenceConfig(CONTOURLENS_REPO_DIR, case_dir, inference_cfg);
         job.kind = JobKind::Inference;
         job.title = "Inference";
         job.case_name = case_dir;
-        StartJob(job, DICOM_RT_REPO_DIR, "source.run_inference_for_gui", { case_dir });
+        StartJob(job, CONTOURLENS_REPO_DIR, "source.run_inference_for_gui", { case_dir });
     };
 
     auto StartLoadDoseJob = [&](const std::string& path)
@@ -1106,7 +1106,7 @@ int main(int argc, char** argv)
         job.kind = JobKind::LoadDose;
         job.title = "Loading dose";
         job.case_name = case_dir;
-        StartJob(job, DICOM_RT_REPO_DIR, "source.gui_load", { "dose", path, "--case", case_dir });
+        StartJob(job, CONTOURLENS_REPO_DIR, "source.gui_load", { "dose", path, "--case", case_dir });
     };
 
     // HD95 for every scored structure (source/gui_metrics.py). Passes this
@@ -1122,7 +1122,7 @@ int main(int argc, char** argv)
         job.kind = JobKind::Hd95;
         job.title = "Computing HD95";
         job.case_name = case_dir;
-        StartJob(job, DICOM_RT_REPO_DIR, "source.gui_metrics", { "hd95", "--case", case_dir, "--pairs", pairs });
+        StartJob(job, CONTOURLENS_REPO_DIR, "source.gui_metrics", { "hd95", "--case", case_dir, "--pairs", pairs });
     };
 
     // metrics.csv + metrics.json from the Metrics table as shown; source/gui_export.py
@@ -1157,7 +1157,7 @@ int main(int argc, char** argv)
     auto StartExportJob = [&]()
     {
         std::filesystem::path out_path = std::filesystem::path(
-            Utf8ToWide(std::string(DICOM_RT_DATA_DIR) + "/" + case_dir + "/exports/" + LocalTimestamp())).lexically_normal();
+            Utf8ToWide(std::string(CONTOURLENS_DATA_DIR) + "/" + case_dir + "/exports/" + LocalTimestamp())).lexically_normal();
         job.kind = JobKind::Export;
         job.title = "Exporting";
         job.case_name = case_dir;
@@ -1172,7 +1172,7 @@ int main(int argc, char** argv)
             return;
         }
         WriteMetricsFiles(out_path);
-        StartJob(job, DICOM_RT_REPO_DIR, "source.gui_export", { "--case", case_dir, "--out", job.output_dir });
+        StartJob(job, CONTOURLENS_REPO_DIR, "source.gui_export", { "--case", case_dir, "--out", job.output_dir });
     };
 
     auto LoadBatchResults = [&](const std::string& dir)
@@ -1187,14 +1187,14 @@ int main(int argc, char** argv)
 
     auto StartBatchJob = [&]()
     {
-        SaveInferenceConfig(DICOM_RT_REPO_DIR, case_dir, inference_cfg); // the batch reads model/backend from this case's config
+        SaveInferenceConfig(CONTOURLENS_REPO_DIR, case_dir, inference_cfg); // the batch reads model/backend from this case's config
         std::filesystem::path out_path = std::filesystem::path(Utf8ToWide(
-            std::string(DICOM_RT_DATA_DIR) + "/batch/" + LocalTimestamp() + "_fold" + std::to_string(batch_fold))).lexically_normal();
+            std::string(CONTOURLENS_DATA_DIR) + "/batch/" + LocalTimestamp() + "_fold" + std::to_string(batch_fold))).lexically_normal();
         job.kind = JobKind::Batch;
         job.title = "Batch evaluation (fold " + std::to_string(batch_fold) + ")";
         job.case_name = case_dir;
         job.output_dir = WideToUtf8(out_path.wstring());
-        StartJob(job, DICOM_RT_REPO_DIR, "source.batch_evaluate", {
+        StartJob(job, CONTOURLENS_REPO_DIR, "source.batch_evaluate", {
             "--case", case_dir, "--fold", std::to_string(batch_fold),
             "--parallel", std::to_string(batch_parallel), "--out", job.output_dir });
     };
@@ -1603,7 +1603,7 @@ int main(int argc, char** argv)
                                 const std::string& pred_name = m.rows[p].name;
                                 std::string pred_key = StructureMatchKey(pred_name);
                                 // Point at whatever the prediction's name itself resolves to, in case it's aliased too.
-                                SaveStructureAlias(DICOM_RT_REPO_DIR, m.rows[g].name,
+                                SaveStructureAlias(CONTOURLENS_REPO_DIR, m.rows[g].name,
                                     pred_key == NormalizeStructureName(pred_name) ? pred_name : pred_key);
                                 aliases_changed = true;
                             }
@@ -1625,7 +1625,7 @@ int main(int argc, char** argv)
                 ImGui::PushID((int)a + 20000);
                 if (ImGui::SmallButton("x"))
                 {
-                    RemoveStructureAlias(DICOM_RT_REPO_DIR, entries[a].first);
+                    RemoveStructureAlias(CONTOURLENS_REPO_DIR, entries[a].first);
                     aliases_changed = true;
                 }
                 ImGui::SameLine();
@@ -1636,7 +1636,7 @@ int main(int argc, char** argv)
         }
     };
 
-    LoadStructureAliases(DICOM_RT_REPO_DIR); // before the first LoadCase: metrics and colors match names through it
+    LoadStructureAliases(CONTOURLENS_REPO_DIR); // before the first LoadCase: metrics and colors match names through it
     LoadCase(case_dir, "");
 
     bool done = false;
@@ -1781,7 +1781,7 @@ int main(int argc, char** argv)
                 if (ImGui::BeginMenu("Recent cases", !job.running))
                 {
                     if (ImGui::IsWindowAppearing())
-                        recent_cases = FindRecentCases(DICOM_RT_DATA_DIR);
+                        recent_cases = FindRecentCases(CONTOURLENS_DATA_DIR);
                     if (recent_cases.empty())
                         ImGui::MenuItem("(no exported cases under data/)", nullptr, false, false);
                     std::string chosen;
@@ -2057,11 +2057,11 @@ int main(int argc, char** argv)
 
                 ImGui::Spacing();
                 if (ImGui::Button("Save Config"))
-                    SaveInferenceConfig(DICOM_RT_REPO_DIR, case_dir, inference_cfg);
+                    SaveInferenceConfig(CONTOURLENS_REPO_DIR, case_dir, inference_cfg);
                 ImGui::SameLine();
                 if (ImGui::Button("Reload Config"))
                 {
-                    LoadInferenceConfig(DICOM_RT_REPO_DIR, case_dir, inference_cfg);
+                    LoadInferenceConfig(CONTOURLENS_REPO_DIR, case_dir, inference_cfg);
                     force_select_backend_tab = true;
                 }
             }

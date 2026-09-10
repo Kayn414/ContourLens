@@ -7,7 +7,7 @@
 // over a pipe: "@@progress {json}" / "@@error {json}" lines (see
 // source/gui_progress.py) drive the progress bar and error text, and every
 // other line is kept as a log tail and echoed to the GUI's own console. See
-// gui/CMakeLists.txt for DICOM_RT_REPO_DIR (the child's working directory, so
+// gui/CMakeLists.txt for CONTOURLENS_REPO_DIR (the child's working directory, so
 // `uv run python -m source...` and its relative data/ paths resolve
 // regardless of where the GUI exe itself lives).
 

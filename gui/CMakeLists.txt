@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(dicom_rt_gui LANGUAGES CXX)
+project(ContourLens LANGUAGES CXX)
 
 include(FetchContent)
 FetchContent_Declare(
@@ -27,7 +27,7 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(implot)
 
-add_executable(dicom_rt_gui
+add_executable(ContourLens
   src/main.cpp
   src/volume.cpp
   src/raycaster.cpp
@@ -47,7 +47,7 @@ add_executable(dicom_rt_gui
   ${implot_SOURCE_DIR}/implot_items.cpp
 )
 
-target_include_directories(dicom_rt_gui PRIVATE
+target_include_directories(ContourLens PRIVATE
   ${imgui_SOURCE_DIR}
   ${imgui_SOURCE_DIR}/backends
   ${imgui_SOURCE_DIR}/misc/cpp
@@ -55,15 +55,15 @@ target_include_directories(dicom_rt_gui PRIVATE
 )
 
 # shell32: DragAcceptFiles/DragQueryFileW (drag-and-drop loading in main.cpp).
-target_link_libraries(dicom_rt_gui PRIVATE d3d11.lib dxgi.lib d3dcompiler.lib shell32.lib nlohmann_json::nlohmann_json)
+target_link_libraries(ContourLens PRIVATE d3d11.lib dxgi.lib d3dcompiler.lib shell32.lib nlohmann_json::nlohmann_json)
 
 # Volume exports (source/export_gui_volume.py) live under <repo>/data, and
 # "Run Inference" (gui/src/inference.cpp) shells out to `uv run python -m
 # source...` from the repo root -- resolve both relative to the repo
 # regardless of the exe's own working directory.
-target_compile_definitions(dicom_rt_gui PRIVATE
-  DICOM_RT_DATA_DIR="${CMAKE_SOURCE_DIR}/../data"
-  DICOM_RT_REPO_DIR="${CMAKE_SOURCE_DIR}/.."
+target_compile_definitions(ContourLens PRIVATE
+  CONTOURLENS_DATA_DIR="${CMAKE_SOURCE_DIR}/../data"
+  CONTOURLENS_REPO_DIR="${CMAKE_SOURCE_DIR}/.."
 )
 
-set_target_properties(dicom_rt_gui PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+set_target_properties(ContourLens PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
